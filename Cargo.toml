@@ -1,0 +1,30 @@
+[package]
+name = "iz-avatar"
+version = "0.1.0"
+edition = "2021"
+description = "IZ Avatar - Nostr-based key service relay agent"
+
+[dependencies]
+# Nostr protocol
+nostr = { version = "0.37", features = ["std", "nip44"] }
+nostr-sdk = "0.37"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# QR code display in terminal
+qrcode = "0.14"
+
+# Error handling
+anyhow = "1"
