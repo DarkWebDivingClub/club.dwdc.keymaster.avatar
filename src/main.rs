@@ -1,19 +1,28 @@
 mod protocol;
 mod session;
+mod ssh_agent;
 
 use anyhow::Result;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{info, warn, error, debug};
+use tokio::sync::{oneshot, RwLock};
+use tracing::{debug, error, info, warn};
 
+use crate::protocol::{Request, Response, PROTOCOL_KIND};
 use crate::session::SessionManager;
-use crate::protocol::{PROTOCOL_KIND, Request, Response};
+use crate::ssh_agent::{AgentIdentitiesReply, AgentRequest, AgentSignReply};
 
 #[derive(Parser, Debug)]
-#[command(name = "iz-avatar", version, about = "IZ Avatar - Nostr-based key service relay agent")]
+#[command(
+    name = "iz-avatar",
+    version,
+    about = "IZ Avatar - Nostr-based key service relay agent"
+)]
 struct Cli {
     /// Nostr relay URL to connect to
     #[arg(long, default_value = "ws://localhost:7000")]
@@ -22,7 +31,14 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// SSH agent socket path
+    #[arg(long, default_value = "/tmp/iz-avatar-ssh-agent.sock")]
+    agent_socket: PathBuf,
 }
+
+/// Pending response futures for service channel requests sent to KM
+type PendingResponses = Arc<RwLock<HashMap<EventId, oneshot::Sender<serde_json::Value>>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -53,8 +69,13 @@ async fn main() -> Result<()> {
     println!("Avatar pubkey: {}", avatar_pubkey.to_hex());
     println!("\nWaiting for KeyMaster attach...\n");
 
-    // Create session manager
+    // Create session manager and pending response tracker
     let session_mgr = Arc::new(RwLock::new(SessionManager::new()));
+    let pending_responses: PendingResponses = Arc::new(RwLock::new(HashMap::new()));
+
+    // Start SSH agent
+    let (_agent_path, mut agent_rx) = ssh_agent::start_agent(&cli.agent_socket).await?;
+    println!("SSH_AUTH_SOCK={}", cli.agent_socket.display());
 
     // Connect to relay
     let client = Client::new(avatar_keys.clone());
@@ -62,7 +83,7 @@ async fn main() -> Result<()> {
     client.connect().await;
     info!("Connected to relay: {}", cli.relay);
 
-    // Subscribe to events addressed to us (kind 27235 with p tag matching our pubkey)
+    // Subscribe to events addressed to us
     let filter = Filter::new()
         .kind(Kind::Custom(PROTOCOL_KIND))
         .pubkey(avatar_pubkey)
@@ -71,12 +92,37 @@ async fn main() -> Result<()> {
     client.subscribe(vec![filter], None).await?;
     info!("Subscribed to kind {} events for our pubkey", PROTOCOL_KIND);
 
+    // Spawn the SSH agent bridge task
+    let agent_session_mgr = session_mgr.clone();
+    let agent_pending = pending_responses.clone();
+    let agent_keys = avatar_keys.clone();
+    let agent_client = client.clone();
+
+    tokio::spawn(async move {
+        while let Some(request) = agent_rx.recv().await {
+            let session_mgr = agent_session_mgr.clone();
+            let pending = agent_pending.clone();
+            let keys = agent_keys.clone();
+            let client = agent_client.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_agent_request(request, &keys, &client, &session_mgr, &pending).await
+                {
+                    error!("Error handling agent request: {}", e);
+                }
+            });
+        }
+    });
+
     // Event loop
+    let event_pending = pending_responses.clone();
     client
         .handle_notifications(|notification| {
             let avatar_keys = avatar_keys.clone();
             let client_clone = client.clone();
             let session_mgr = session_mgr.clone();
+            let pending = event_pending.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
@@ -85,6 +131,7 @@ async fn main() -> Result<()> {
                             &avatar_keys,
                             &client_clone,
                             &session_mgr,
+                            &pending,
                             &event,
                         )
                         .await
@@ -101,39 +148,305 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn handle_agent_request(
+    request: AgentRequest,
+    avatar_keys: &Keys,
+    client: &Client,
+    session_mgr: &Arc<RwLock<SessionManager>>,
+    pending: &PendingResponses,
+) -> Result<()> {
+    // Find SSH service channel
+    let channel_info = {
+        let mgr = session_mgr.read().await;
+        mgr.find_ssh_channel()
+    };
+
+    let (service_keys, km_service_pubkey) = match channel_info {
+        Some(info) => info,
+        None => {
+            warn!("No SSH service channel available");
+            match request {
+                AgentRequest::RequestIdentities { reply } => {
+                    let _ = reply.send(AgentIdentitiesReply {
+                        identities: vec![],
+                    });
+                }
+                AgentRequest::SignRequest { reply, .. } => {
+                    let _ = reply.send(AgentSignReply { signature: None });
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    match request {
+        AgentRequest::RequestIdentities { reply } => {
+            info!("[SSH Agent] request_identities → forwarding to KM");
+            let req = Request {
+                method: "request_identities".to_string(),
+                params: vec![],
+            };
+            let event_id =
+                send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
+
+            // Wait for KM response
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut p = pending.write().await;
+                p.insert(event_id, tx);
+            }
+
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                Ok(Ok(result)) => {
+                    let mut identities = Vec::new();
+                    if let Some(idents) = result.get("identities").and_then(|v| v.as_array()) {
+                        for ident in idents {
+                            let key_blob_b64 = ident
+                                .get("key_blob")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let comment = ident
+                                .get("comment")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if let Ok(key_blob) = BASE64.decode(key_blob_b64) {
+                                identities.push((key_blob, comment.to_string()));
+                            }
+                        }
+                    }
+                    info!(
+                        "[SSH Agent] Got {} identities from KM",
+                        identities.len()
+                    );
+                    let _ = reply.send(AgentIdentitiesReply { identities });
+                }
+                Ok(Err(_)) => {
+                    error!("[SSH Agent] Response channel dropped");
+                    let _ = reply.send(AgentIdentitiesReply {
+                        identities: vec![],
+                    });
+                }
+                Err(_) => {
+                    error!("[SSH Agent] Timeout waiting for identities from KM");
+                    let _ = reply.send(AgentIdentitiesReply {
+                        identities: vec![],
+                    });
+                }
+            }
+        }
+        AgentRequest::SignRequest {
+            key_blob,
+            data,
+            flags,
+            reply,
+        } => {
+            info!(
+                "[SSH Agent] sign_request → forwarding to KM ({} bytes data)",
+                data.len()
+            );
+            let req = Request {
+                method: "sign_request".to_string(),
+                params: vec![serde_json::json!({
+                    "key_blob": BASE64.encode(&key_blob),
+                    "data": BASE64.encode(&data),
+                    "flags": flags,
+                })],
+            };
+            let event_id =
+                send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
+
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut p = pending.write().await;
+                p.insert(event_id, tx);
+            }
+
+            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                Ok(Ok(result)) => {
+                    let sig = result
+                        .get("signature")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| BASE64.decode(s).ok());
+                    if sig.is_some() {
+                        info!("[SSH Agent] Got signature from KM");
+                    } else {
+                        error!("[SSH Agent] Invalid signature from KM");
+                    }
+                    let _ = reply.send(AgentSignReply { signature: sig });
+                }
+                Ok(Err(_)) => {
+                    error!("[SSH Agent] Response channel dropped");
+                    let _ = reply.send(AgentSignReply { signature: None });
+                }
+                Err(_) => {
+                    error!("[SSH Agent] Timeout waiting for signature from KM");
+                    let _ = reply.send(AgentSignReply { signature: None });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Send a service channel request from Avatar's service keypair to KM's service keypair
+async fn send_service_request(
+    service_keys: &Keys,
+    client: &Client,
+    km_service_pubkey: &PublicKey,
+    request: &Request,
+) -> Result<EventId> {
+    let request_json = serde_json::to_string(request)?;
+    let encrypted = nip44::encrypt(
+        service_keys.secret_key(),
+        km_service_pubkey,
+        &request_json,
+        nip44::Version::V2,
+    )?;
+
+    let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
+        .tag(Tag::public_key(*km_service_pubkey))
+        .sign_with_keys(service_keys)?;
+
+    let event_id = event.id;
+    client.send_event(event).await?;
+    debug!(
+        "Sent service request {} to {}",
+        event_id,
+        km_service_pubkey.to_hex()
+    );
+    Ok(event_id)
+}
+
 async fn handle_event(
     avatar_keys: &Keys,
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
+    pending: &PendingResponses,
     event: &Event,
 ) -> Result<()> {
     let sender_pubkey = event.pubkey;
-    debug!("Received event {} from {}", event.id, sender_pubkey.to_hex());
+    debug!(
+        "Received event {} from {}",
+        event.id,
+        sender_pubkey.to_hex()
+    );
 
-    // Decrypt NIP-44 content
-    let plaintext = nip44::decrypt(
-        avatar_keys.secret_key(),
-        &sender_pubkey,
-        &event.content,
-    )?;
+    // Try to decrypt with avatar root keys first
+    let plaintext = match nip44::decrypt(avatar_keys.secret_key(), &sender_pubkey, &event.content) {
+        Ok(pt) => pt,
+        Err(_) => {
+            // Try to decrypt with service channel keys
+            let mgr = session_mgr.read().await;
+            match mgr.try_decrypt_with_service_keys(&sender_pubkey, &event.content) {
+                Some(pt) => pt,
+                None => {
+                    debug!("Could not decrypt event {} from {}", event.id, sender_pubkey.to_hex());
+                    return Ok(());
+                }
+            }
+        }
+    };
+
     debug!("Decrypted content: {}", plaintext);
 
-    let request: Request = serde_json::from_str(&plaintext)?;
-    info!("Received method: {} from {}", request.method, sender_pubkey.to_hex());
+    // Try parsing as response first (has result or error)
+    let json: serde_json::Value = serde_json::from_str(&plaintext)?;
 
-    match request.method.as_str() {
-        "attach" => {
-            handle_attach(avatar_keys, client, session_mgr, event, &sender_pubkey, &request).await
+    if json.get("result").is_some() || json.get("error").is_some() {
+        // This is a response — check if it's a service.spawn response or a service channel response
+        handle_response(session_mgr, pending, event, &json).await
+    } else if json.get("method").is_some() {
+        // This is a request
+        let request: Request = serde_json::from_value(json)?;
+        info!(
+            "Received method: {} from {}",
+            request.method,
+            sender_pubkey.to_hex()
+        );
+
+        match request.method.as_str() {
+            "attach" => {
+                handle_attach(
+                    avatar_keys,
+                    client,
+                    session_mgr,
+                    event,
+                    &sender_pubkey,
+                    &request,
+                )
+                .await
+            }
+            "detach" => {
+                handle_detach(avatar_keys, client, session_mgr, event, &sender_pubkey).await
+            }
+            _ => {
+                warn!("Unknown method: {}", request.method);
+                let response = Response::error("unknown method");
+                send_response(avatar_keys, client, &sender_pubkey, &event.id, &response).await
+            }
         }
-        "detach" => {
-            handle_detach(avatar_keys, client, session_mgr, event, &sender_pubkey).await
+    } else {
+        warn!("Unknown message format");
+        Ok(())
+    }
+}
+
+async fn handle_response(
+    session_mgr: &Arc<RwLock<SessionManager>>,
+    pending: &PendingResponses,
+    event: &Event,
+    json: &serde_json::Value,
+) -> Result<()> {
+    // Find the reply-to event ID from e tags
+    let reply_to = event.tags.iter().find_map(|tag| {
+        let vec = tag.as_slice();
+        if vec.len() >= 4 && vec[0] == "e" && vec[3] == "reply" {
+            EventId::from_hex(&vec[1]).ok()
+        } else {
+            None
         }
-        _ => {
-            warn!("Unknown method: {}", request.method);
-            let response = Response::error("unknown method");
-            send_response(avatar_keys, client, &sender_pubkey, &event.id, &response).await
+    });
+
+    if let Some(reply_to_id) = reply_to {
+        // Check if this is a response to a service.spawn request
+        {
+            let mut mgr = session_mgr.write().await;
+            if let Some(result) = json.get("result") {
+                if let Some(service_pubkey_hex) = result.get("service_pubkey").and_then(|v| v.as_str()) {
+                    // This is a service.spawn response — store KM's service pubkey
+                    if let Ok(km_svc_pk) = PublicKey::from_hex(service_pubkey_hex) {
+                        mgr.set_km_service_pubkey(&reply_to_id, km_svc_pk);
+                        info!(
+                            "SSH service channel established. KM service pubkey: {}",
+                            service_pubkey_hex
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Check if this is a response to a pending service channel request
+        let tx = {
+            let mut p = pending.write().await;
+            p.remove(&reply_to_id)
+        };
+
+        if let Some(tx) = tx {
+            if let Some(result) = json.get("result") {
+                let _ = tx.send(result.clone());
+                debug!("Delivered response for {}", reply_to_id);
+            } else if let Some(err) = json.get("error") {
+                error!("Service error response: {}", err);
+                let _ = tx.send(serde_json::json!({}));
+            }
+        } else {
+            debug!("Response to {} with no pending handler", reply_to_id);
         }
     }
+
+    Ok(())
 }
 
 async fn handle_attach(
@@ -146,34 +459,45 @@ async fn handle_attach(
 ) -> Result<()> {
     info!("=== ATTACH from KeyMaster {} ===", km_pubkey.to_hex());
 
-    // Parse attach params
-    let params = request.params.first()
+    let params = request
+        .params
+        .first()
         .ok_or_else(|| anyhow::anyhow!("attach: missing params"))?;
 
-    let services = params.get("services")
+    let services = params
+        .get("services")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|s| s.get("service_type").and_then(|t| t.as_str()).map(String::from))
+                .filter_map(|s| {
+                    s.get("service_type")
+                        .and_then(|t| t.as_str())
+                        .map(String::from)
+                })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
 
-    let identity = params.get("identity")
+    let identity = params
+        .get("identity")
         .and_then(|v| v.as_str())
         .unwrap_or("default")
         .to_string();
 
-    let alt_ids: Vec<String> = params.get("alt_id")
+    let alt_ids: Vec<String> = params
+        .get("alt_id")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
 
     info!("  Services: {:?}", services);
     info!("  Identity: {}", identity);
     info!("  Alt IDs: {:?}", alt_ids);
 
-    // Store session — the attach event ID becomes the session anchor
     let attached_session_event_id = event.id;
     {
         let mut mgr = session_mgr.write().await;
@@ -186,12 +510,13 @@ async fn handle_attach(
         );
     }
 
-    // Send attach response
     let response = Response::ok();
     send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
-    info!("Attach response sent. Session established: {}", attached_session_event_id);
+    info!(
+        "Attach response sent. Session established: {}",
+        attached_session_event_id
+    );
 
-    // Now initiate service.spawn for each service the KM advertised
     for service_type in &services {
         info!("Spawning service channel for: {}", service_type);
         spawn_service_channel(
@@ -220,7 +545,6 @@ async fn spawn_service_channel(
     identity: &str,
     alt_ids: &[String],
 ) -> Result<()> {
-    // Generate a service-channel keypair for the Avatar side
     let service_avatar_keys = Keys::generate();
     let service_avatar_pubkey = service_avatar_keys.public_key();
 
@@ -230,18 +554,20 @@ async fn spawn_service_channel(
         service_avatar_pubkey.to_hex()
     );
 
-    // Build allowed_identity list
     let mut allowed_identity = vec![identity.to_string()];
     allowed_identity.extend(alt_ids.iter().cloned());
 
-    // Determine methods based on service type
     let methods: Vec<&str> = match service_type {
         "ssh" => vec!["request_identities", "sign_request"],
-        "nostr" => vec!["get_public_key", "sign_event", "nip44_encrypt", "nip44_decrypt"],
+        "nostr" => vec![
+            "get_public_key",
+            "sign_event",
+            "nip44_encrypt",
+            "nip44_decrypt",
+        ],
         _ => vec![],
     };
 
-    // Send service.spawn request to KM
     let spawn_request = Request {
         method: "service.spawn".to_string(),
         params: vec![serde_json::json!({
@@ -260,7 +586,6 @@ async fn spawn_service_channel(
         nip44::Version::V2,
     )?;
 
-    // Build event with session tag
     let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
         .tag(Tag::public_key(*km_pubkey))
         .tag(Tag::custom(
@@ -277,7 +602,6 @@ async fn spawn_service_channel(
     client.send_event(event).await?;
     info!("  Sent service.spawn request (event: {})", spawn_event_id);
 
-    // Store the service channel in session manager
     {
         let mut mgr = session_mgr.write().await;
         mgr.add_service_channel(
@@ -288,7 +612,6 @@ async fn spawn_service_channel(
         );
     }
 
-    // Subscribe to events for the service channel keypair
     let svc_filter = Filter::new()
         .kind(Kind::Custom(PROTOCOL_KIND))
         .pubkey(service_avatar_pubkey)
@@ -312,7 +635,6 @@ async fn handle_detach(
 ) -> Result<()> {
     info!("=== DETACH from KeyMaster {} ===", km_pubkey.to_hex());
 
-    // Find and remove the session
     let session_id = {
         let mgr = session_mgr.read().await;
         mgr.find_session_by_km_pubkey(km_pubkey)
@@ -326,7 +648,6 @@ async fn handle_detach(
         warn!("No active session found for {}", km_pubkey.to_hex());
     }
 
-    // Send detach response
     let response = Response::ok();
     send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
     info!("Detach response sent");
@@ -358,7 +679,11 @@ async fn send_response(
         .sign_with_keys(avatar_keys)?;
 
     client.send_event(event).await?;
-    debug!("Sent response to {} (reply to {})", recipient.to_hex(), reply_to);
+    debug!(
+        "Sent response to {} (reply to {})",
+        recipient.to_hex(),
+        reply_to
+    );
     Ok(())
 }
 

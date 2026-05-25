@@ -26,5 +26,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # QR code display in terminal
 qrcode = "0.14"
 
+# Base64 encoding
+base64 = "0.22"
+
 # Error handling
 anyhow = "1"

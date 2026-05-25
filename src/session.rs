@@ -1,6 +1,7 @@
 use nostr::prelude::*;
+use nostr::nips::nip44;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{info, debug};
 
 /// A service channel within a session
 pub struct ServiceChannel {
@@ -99,5 +100,54 @@ impl SessionManager {
 
     pub fn get_session_mut(&mut self, session_id: &EventId) -> Option<&mut RootSession> {
         self.sessions.get_mut(session_id)
+    }
+
+    /// Find the SSH service channel keys and KM service pubkey (if channel is established)
+    pub fn find_ssh_channel(&self) -> Option<(Keys, PublicKey)> {
+        for session in self.sessions.values() {
+            if let Some(channel) = session.channels.get("ssh") {
+                if let Some(km_svc_pk) = channel.km_service_pubkey {
+                    return Some((channel.service_avatar_keys.clone(), km_svc_pk));
+                }
+            }
+        }
+        None
+    }
+
+    /// Set the KM service pubkey for a service channel identified by the spawn event ID
+    pub fn set_km_service_pubkey(&mut self, spawn_event_id: &EventId, km_service_pubkey: PublicKey) {
+        for session in self.sessions.values_mut() {
+            for channel in session.channels.values_mut() {
+                if channel.spawn_event_id == *spawn_event_id {
+                    channel.km_service_pubkey = Some(km_service_pubkey);
+                    info!(
+                        "Set KM service pubkey for {} channel: {}",
+                        channel.service_type,
+                        km_service_pubkey.to_hex()
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Try to decrypt an event with any service channel keys
+    pub fn try_decrypt_with_service_keys(&self, sender_pubkey: &PublicKey, content: &str) -> Option<String> {
+        for session in self.sessions.values() {
+            for channel in session.channels.values() {
+                match nip44::decrypt(
+                    channel.service_avatar_keys.secret_key(),
+                    sender_pubkey,
+                    content,
+                ) {
+                    Ok(plaintext) => {
+                        debug!("Decrypted with service channel key for {}", channel.service_type);
+                        return Some(plaintext);
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+        None
     }
 }
