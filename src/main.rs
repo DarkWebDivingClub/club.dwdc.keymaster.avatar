@@ -1,3 +1,4 @@
+mod gpg_agent;
 mod protocol;
 mod session;
 mod ssh_agent;
@@ -13,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::gpg_agent::{GpgAgentRequest, GpgKeyInfo, PkSignReply, RequestKeysReply};
 use crate::protocol::{Request, Response, PROTOCOL_KIND};
 use crate::session::SessionManager;
 use crate::ssh_agent::{AgentIdentitiesReply, AgentRequest, AgentSignReply};
@@ -35,6 +37,10 @@ struct Cli {
     /// SSH agent socket path
     #[arg(long, default_value = "/tmp/iz-avatar-ssh-agent.sock")]
     agent_socket: PathBuf,
+
+    /// GPG agent socket path
+    #[arg(long, default_value = "/tmp/iz-avatar-gpg-agent.sock")]
+    gpg_agent_socket: PathBuf,
 }
 
 /// Pending response futures for service channel requests sent to KM
@@ -77,6 +83,11 @@ async fn main() -> Result<()> {
     let (_agent_path, mut agent_rx) = ssh_agent::start_agent(&cli.agent_socket).await?;
     println!("SSH_AUTH_SOCK={}", cli.agent_socket.display());
 
+    // Start GPG agent
+    let (_gpg_agent_path, mut gpg_agent_rx) =
+        gpg_agent::start_gpg_agent(&cli.gpg_agent_socket).await?;
+    println!("GPG_AGENT_SOCK={}", cli.gpg_agent_socket.display());
+
     // Connect to relay
     let client = Client::new(avatar_keys.clone());
     client.add_relay(&cli.relay).await?;
@@ -110,6 +121,29 @@ async fn main() -> Result<()> {
                     handle_agent_request(request, &keys, &client, &session_mgr, &pending).await
                 {
                     error!("Error handling agent request: {}", e);
+                }
+            });
+        }
+    });
+
+    // Spawn the GPG agent bridge task
+    let gpg_session_mgr = session_mgr.clone();
+    let gpg_pending = pending_responses.clone();
+    let gpg_keys = avatar_keys.clone();
+    let gpg_client = client.clone();
+
+    tokio::spawn(async move {
+        while let Some(request) = gpg_agent_rx.recv().await {
+            let session_mgr = gpg_session_mgr.clone();
+            let pending = gpg_pending.clone();
+            let keys = gpg_keys.clone();
+            let client = gpg_client.clone();
+
+            tokio::spawn(async move {
+                if let Err(e) =
+                    handle_gpg_agent_request(request, &keys, &client, &session_mgr, &pending).await
+                {
+                    error!("Error handling GPG agent request: {}", e);
                 }
             });
         }
@@ -155,24 +189,263 @@ async fn handle_agent_request(
     session_mgr: &Arc<RwLock<SessionManager>>,
     pending: &PendingResponses,
 ) -> Result<()> {
-    // Find SSH service channel
-    let channel_info = {
+    // Find SSH service channel (for Ed25519 keys)
+    let ssh_channel_info = {
         let mgr = session_mgr.read().await;
         mgr.find_ssh_channel()
+    };
+
+    // Find GPG service channel (for RSA keys)
+    let gpg_channel_info = {
+        let mgr = session_mgr.read().await;
+        mgr.find_gpg_channel()
+    };
+
+    if ssh_channel_info.is_none() && gpg_channel_info.is_none() {
+        warn!("No SSH or GPG service channel available");
+        match request {
+            AgentRequest::RequestIdentities { reply } => {
+                let _ = reply.send(AgentIdentitiesReply {
+                    identities: vec![],
+                });
+            }
+            AgentRequest::SignRequest { reply, .. } => {
+                let _ = reply.send(AgentSignReply { signature: None, key_type: String::new() });
+            }
+        }
+        return Ok(());
+    }
+
+    match request {
+        AgentRequest::RequestIdentities { reply } => {
+            info!("[SSH Agent] request_identities → forwarding to KM");
+            let mut identities = Vec::new();
+
+            // Get Ed25519 identities from SSH service channel
+            if let Some((ref service_keys, ref km_service_pubkey)) = ssh_channel_info {
+                let req = Request {
+                    method: "request_identities".to_string(),
+                    params: vec![],
+                };
+                let event_id =
+                    send_service_request(service_keys, client, km_service_pubkey, &req).await?;
+
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut p = pending.write().await;
+                    p.insert(event_id, tx);
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                    Ok(Ok(result)) => {
+                        if let Some(idents) = result.get("identities").and_then(|v| v.as_array()) {
+                            for ident in idents {
+                                let key_blob_b64 = ident
+                                    .get("key_blob")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let comment = ident
+                                    .get("comment")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                if let Ok(key_blob) = BASE64.decode(key_blob_b64) {
+                                    identities.push((key_blob, comment.to_string()));
+                                }
+                            }
+                        }
+                        info!("[SSH Agent] Got {} SSH identities from KM", identities.len());
+                    }
+                    Ok(Err(_)) => {
+                        error!("[SSH Agent] Response channel dropped for SSH identities");
+                    }
+                    Err(_) => {
+                        error!("[SSH Agent] Timeout waiting for SSH identities from KM");
+                    }
+                }
+            }
+
+            // Get RSA identities from GPG service channel
+            if let Some((ref service_keys, ref km_service_pubkey)) = gpg_channel_info {
+                let req = Request {
+                    method: "request_keys".to_string(),
+                    params: vec![],
+                };
+                let event_id =
+                    send_service_request(service_keys, client, km_service_pubkey, &req).await?;
+
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut p = pending.write().await;
+                    p.insert(event_id, tx);
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                    Ok(Ok(result)) => {
+                        if let Some(key_arr) = result.get("keys").and_then(|v| v.as_array()) {
+                            for k in key_arr {
+                                let n_b64 = k.get("n_b64").and_then(|v| v.as_str()).unwrap_or("");
+                                let e_b64 = k.get("e_b64").and_then(|v| v.as_str()).unwrap_or("");
+                                if let (Ok(n_bytes), Ok(e_bytes)) = (BASE64.decode(n_b64), BASE64.decode(e_b64)) {
+                                    let key_blob = build_ssh_rsa_key_blob(&e_bytes, &n_bytes);
+                                    identities.push((key_blob, "GPG RSA key".to_string()));
+                                }
+                            }
+                        }
+                        info!("[SSH Agent] Got RSA identities from GPG channel, total now: {}", identities.len());
+                    }
+                    Ok(Err(_)) => {
+                        error!("[SSH Agent] Response channel dropped for GPG keys");
+                    }
+                    Err(_) => {
+                        error!("[SSH Agent] Timeout waiting for GPG keys from KM");
+                    }
+                }
+            }
+
+            let _ = reply.send(AgentIdentitiesReply { identities });
+        }
+        AgentRequest::SignRequest {
+            key_blob,
+            data,
+            flags,
+            reply,
+        } => {
+            // Determine key type from key blob
+            let algo = extract_algo_from_key_blob(&key_blob).unwrap_or_default();
+            info!(
+                "[SSH Agent] sign_request (algo={}) → forwarding to KM ({} bytes data)",
+                algo, data.len()
+            );
+
+            if algo == "ssh-rsa" {
+                // Route RSA signing to GPG service channel via pksign_raw
+                let (service_keys, km_service_pubkey) = match gpg_channel_info {
+                    Some(info) => info,
+                    None => {
+                        error!("[SSH Agent] No GPG service channel for RSA sign");
+                        let _ = reply.send(AgentSignReply { signature: None, key_type: "ssh-rsa".to_string() });
+                        return Ok(());
+                    }
+                };
+
+                // The data from PKCS#11 is the DigestInfo (already DER-encoded)
+                let req = Request {
+                    method: "pksign_raw".to_string(),
+                    params: vec![serde_json::json!({
+                        "digest_info": BASE64.encode(&data),
+                    })],
+                };
+                let event_id =
+                    send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
+
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut p = pending.write().await;
+                    p.insert(event_id, tx);
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                    Ok(Ok(result)) => {
+                        let sig = result
+                            .get("signature")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| BASE64.decode(s).ok());
+                        if sig.is_some() {
+                            info!("[SSH Agent] Got RSA signature from KM (GPG channel)");
+                        } else {
+                            error!("[SSH Agent] Invalid RSA signature from KM");
+                        }
+                        let _ = reply.send(AgentSignReply { signature: sig, key_type: "ssh-rsa".to_string() });
+                    }
+                    Ok(Err(_)) => {
+                        error!("[SSH Agent] Response channel dropped");
+                        let _ = reply.send(AgentSignReply { signature: None, key_type: "ssh-rsa".to_string() });
+                    }
+                    Err(_) => {
+                        error!("[SSH Agent] Timeout waiting for RSA signature from KM");
+                        let _ = reply.send(AgentSignReply { signature: None, key_type: "ssh-rsa".to_string() });
+                    }
+                }
+            } else {
+                // Ed25519 — existing SSH service channel flow
+                let (service_keys, km_service_pubkey) = match ssh_channel_info {
+                    Some(info) => info,
+                    None => {
+                        error!("[SSH Agent] No SSH service channel for Ed25519 sign");
+                        let _ = reply.send(AgentSignReply { signature: None, key_type: "ssh-ed25519".to_string() });
+                        return Ok(());
+                    }
+                };
+
+                let req = Request {
+                    method: "sign_request".to_string(),
+                    params: vec![serde_json::json!({
+                        "key_blob": BASE64.encode(&key_blob),
+                        "data": BASE64.encode(&data),
+                        "flags": flags,
+                    })],
+                };
+                let event_id =
+                    send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
+
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut p = pending.write().await;
+                    p.insert(event_id, tx);
+                }
+
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+                    Ok(Ok(result)) => {
+                        let sig = result
+                            .get("signature")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| BASE64.decode(s).ok());
+                        if sig.is_some() {
+                            info!("[SSH Agent] Got signature from KM");
+                        } else {
+                            error!("[SSH Agent] Invalid signature from KM");
+                        }
+                        let _ = reply.send(AgentSignReply { signature: sig, key_type: "ssh-ed25519".to_string() });
+                    }
+                    Ok(Err(_)) => {
+                        error!("[SSH Agent] Response channel dropped");
+                        let _ = reply.send(AgentSignReply { signature: None, key_type: "ssh-ed25519".to_string() });
+                    }
+                    Err(_) => {
+                        error!("[SSH Agent] Timeout waiting for signature from KM");
+                        let _ = reply.send(AgentSignReply { signature: None, key_type: "ssh-ed25519".to_string() });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_gpg_agent_request(
+    request: GpgAgentRequest,
+    _avatar_keys: &Keys,
+    client: &Client,
+    session_mgr: &Arc<RwLock<SessionManager>>,
+    pending: &PendingResponses,
+) -> Result<()> {
+    // Find GPG service channel
+    let channel_info = {
+        let mgr = session_mgr.read().await;
+        mgr.find_gpg_channel()
     };
 
     let (service_keys, km_service_pubkey) = match channel_info {
         Some(info) => info,
         None => {
-            warn!("No SSH service channel available");
+            warn!("No GPG service channel available");
             match request {
-                AgentRequest::RequestIdentities { reply } => {
-                    let _ = reply.send(AgentIdentitiesReply {
-                        identities: vec![],
-                    });
+                GpgAgentRequest::RequestKeys { reply } => {
+                    let _ = reply.send(RequestKeysReply { keys: vec![] });
                 }
-                AgentRequest::SignRequest { reply, .. } => {
-                    let _ = reply.send(AgentSignReply { signature: None });
+                GpgAgentRequest::PkSign { reply, .. } => {
+                    let _ = reply.send(PkSignReply { signature: None });
                 }
             }
             return Ok(());
@@ -180,16 +453,15 @@ async fn handle_agent_request(
     };
 
     match request {
-        AgentRequest::RequestIdentities { reply } => {
-            info!("[SSH Agent] request_identities → forwarding to KM");
+        GpgAgentRequest::RequestKeys { reply } => {
+            info!("[GPG Agent] request_keys → forwarding to KM");
             let req = Request {
-                method: "request_identities".to_string(),
+                method: "request_keys".to_string(),
                 params: vec![],
             };
             let event_id =
                 send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
 
-            // Wait for KM response
             let (tx, rx) = oneshot::channel();
             {
                 let mut p = pending.write().await;
@@ -198,58 +470,60 @@ async fn handle_agent_request(
 
             match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
                 Ok(Ok(result)) => {
-                    let mut identities = Vec::new();
-                    if let Some(idents) = result.get("identities").and_then(|v| v.as_array()) {
-                        for ident in idents {
-                            let key_blob_b64 = ident
-                                .get("key_blob")
+                    let mut keys = Vec::new();
+                    if let Some(key_arr) = result.get("keys").and_then(|v| v.as_array()) {
+                        for k in key_arr {
+                            let keygrip = k
+                                .get("keygrip")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let comment = ident
-                                .get("comment")
+                                .unwrap_or("")
+                                .to_string();
+                            let n_b64 = k
+                                .get("n_b64")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if let Ok(key_blob) = BASE64.decode(key_blob_b64) {
-                                identities.push((key_blob, comment.to_string()));
-                            }
+                                .unwrap_or("")
+                                .to_string();
+                            let e_b64 = k
+                                .get("e_b64")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            keys.push(GpgKeyInfo {
+                                keygrip,
+                                n_b64,
+                                e_b64,
+                            });
                         }
                     }
-                    info!(
-                        "[SSH Agent] Got {} identities from KM",
-                        identities.len()
-                    );
-                    let _ = reply.send(AgentIdentitiesReply { identities });
+                    info!("[GPG Agent] Got {} keys from KM", keys.len());
+                    let _ = reply.send(RequestKeysReply { keys });
                 }
                 Ok(Err(_)) => {
-                    error!("[SSH Agent] Response channel dropped");
-                    let _ = reply.send(AgentIdentitiesReply {
-                        identities: vec![],
-                    });
+                    error!("[GPG Agent] Response channel dropped");
+                    let _ = reply.send(RequestKeysReply { keys: vec![] });
                 }
                 Err(_) => {
-                    error!("[SSH Agent] Timeout waiting for identities from KM");
-                    let _ = reply.send(AgentIdentitiesReply {
-                        identities: vec![],
-                    });
+                    error!("[GPG Agent] Timeout waiting for keys from KM");
+                    let _ = reply.send(RequestKeysReply { keys: vec![] });
                 }
             }
         }
-        AgentRequest::SignRequest {
-            key_blob,
-            data,
-            flags,
+        GpgAgentRequest::PkSign {
+            keygrip,
+            hash_algo,
+            hash_hex,
             reply,
         } => {
             info!(
-                "[SSH Agent] sign_request → forwarding to KM ({} bytes data)",
-                data.len()
+                "[GPG Agent] pksign → forwarding to KM (keygrip={}, algo={})",
+                keygrip, hash_algo
             );
             let req = Request {
-                method: "sign_request".to_string(),
+                method: "pksign".to_string(),
                 params: vec![serde_json::json!({
-                    "key_blob": BASE64.encode(&key_blob),
-                    "data": BASE64.encode(&data),
-                    "flags": flags,
+                    "keygrip": keygrip,
+                    "hash_algo": hash_algo,
+                    "hash_data": hash_hex,
                 })],
             };
             let event_id =
@@ -268,19 +542,19 @@ async fn handle_agent_request(
                         .and_then(|v| v.as_str())
                         .and_then(|s| BASE64.decode(s).ok());
                     if sig.is_some() {
-                        info!("[SSH Agent] Got signature from KM");
+                        info!("[GPG Agent] Got signature from KM");
                     } else {
-                        error!("[SSH Agent] Invalid signature from KM");
+                        error!("[GPG Agent] Invalid signature from KM");
                     }
-                    let _ = reply.send(AgentSignReply { signature: sig });
+                    let _ = reply.send(PkSignReply { signature: sig });
                 }
                 Ok(Err(_)) => {
-                    error!("[SSH Agent] Response channel dropped");
-                    let _ = reply.send(AgentSignReply { signature: None });
+                    error!("[GPG Agent] Response channel dropped");
+                    let _ = reply.send(PkSignReply { signature: None });
                 }
                 Err(_) => {
-                    error!("[SSH Agent] Timeout waiting for signature from KM");
-                    let _ = reply.send(AgentSignReply { signature: None });
+                    error!("[GPG Agent] Timeout waiting for signature from KM");
+                    let _ = reply.send(PkSignReply { signature: None });
                 }
             }
         }
@@ -418,7 +692,7 @@ async fn handle_response(
                     if let Ok(km_svc_pk) = PublicKey::from_hex(service_pubkey_hex) {
                         mgr.set_km_service_pubkey(&reply_to_id, km_svc_pk);
                         info!(
-                            "SSH service channel established. KM service pubkey: {}",
+                            "Service channel established. KM service pubkey: {}",
                             service_pubkey_hex
                         );
                         return Ok(());
@@ -559,6 +833,7 @@ async fn spawn_service_channel(
 
     let methods: Vec<&str> = match service_type {
         "ssh" => vec!["request_identities", "sign_request"],
+        "gpg" => vec!["request_keys", "pksign", "pksign_raw"],
         "nostr" => vec![
             "get_public_key",
             "sign_event",
@@ -685,6 +960,36 @@ async fn send_response(
         reply_to
     );
     Ok(())
+}
+
+/// Build an SSH RSA key blob from unsigned big-endian exponent and modulus bytes.
+/// SSH RSA key blob format: string("ssh-rsa") + mpint(e) + mpint(n)
+fn build_ssh_rsa_key_blob(e_unsigned: &[u8], n_unsigned: &[u8]) -> Vec<u8> {
+    let mut blob = Vec::new();
+    let algo = b"ssh-rsa";
+    blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
+    blob.extend_from_slice(algo);
+
+    // Write mpint: if high bit is set, prepend a 0x00 byte
+    for bytes in [e_unsigned, n_unsigned] {
+        if !bytes.is_empty() && bytes[0] & 0x80 != 0 {
+            blob.extend_from_slice(&((bytes.len() + 1) as u32).to_be_bytes());
+            blob.push(0x00);
+            blob.extend_from_slice(bytes);
+        } else {
+            blob.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            blob.extend_from_slice(bytes);
+        }
+    }
+    blob
+}
+
+/// Extract the algorithm name from an SSH key blob.
+fn extract_algo_from_key_blob(key_blob: &[u8]) -> Option<String> {
+    if key_blob.len() < 4 { return None; }
+    let algo_len = u32::from_be_bytes([key_blob[0], key_blob[1], key_blob[2], key_blob[3]]) as usize;
+    if 4 + algo_len > key_blob.len() { return None; }
+    String::from_utf8(key_blob[4..4+algo_len].to_vec()).ok()
 }
 
 fn display_qr(data: &str) {

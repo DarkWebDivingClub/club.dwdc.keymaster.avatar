@@ -34,8 +34,10 @@ pub struct AgentIdentitiesReply {
 
 #[derive(Debug)]
 pub struct AgentSignReply {
-    /// Raw Ed25519 signature bytes (64 bytes)
+    /// Raw signature bytes
     pub signature: Option<Vec<u8>>,
+    /// Key type for the signature response (e.g. "ssh-ed25519", "ssh-rsa")
+    pub key_type: String,
 }
 
 /// Start the SSH agent Unix socket listener.
@@ -187,7 +189,7 @@ async fn handle_sign_request(body: &[u8], tx: &mpsc::Sender<AgentRequest>) -> Ve
     match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
         Ok(Ok(reply)) => {
             match reply.signature {
-                Some(sig) => build_sign_response(&sig),
+                Some(sig) => build_sign_response(&sig, &reply.key_type),
                 None => vec![SSH_AGENT_FAILURE],
             }
         }
@@ -223,10 +225,10 @@ fn build_identities_answer(identities: &[(Vec<u8>, String)]) -> Vec<u8> {
     buf
 }
 
-fn build_sign_response(raw_signature: &[u8]) -> Vec<u8> {
+fn build_sign_response(raw_signature: &[u8], key_type: &str) -> Vec<u8> {
     // SSH signature format: string signature_blob
     // where signature_blob = string algorithm_name + string signature
-    let algo = b"ssh-ed25519";
+    let algo = key_type.as_bytes();
 
     let mut sig_blob = Vec::new();
     sig_blob.extend_from_slice(&(algo.len() as u32).to_be_bytes());
