@@ -126,6 +126,18 @@ impl SessionManager {
         None
     }
 
+    /// Find any service channel by type — used by local_api for service-agnostic forwarding
+    pub fn find_service_channel(&self, service_type: &str) -> Option<(Keys, PublicKey)> {
+        for session in self.sessions.values() {
+            if let Some(channel) = session.channels.get(service_type) {
+                if let Some(km_svc_pk) = channel.km_service_pubkey {
+                    return Some((channel.service_avatar_keys.clone(), km_svc_pk));
+                }
+            }
+        }
+        None
+    }
+
     /// Set the KM service pubkey for a service channel identified by the spawn event ID
     pub fn set_km_service_pubkey(&mut self, spawn_event_id: &EventId, km_service_pubkey: PublicKey) {
         for session in self.sessions.values_mut() {

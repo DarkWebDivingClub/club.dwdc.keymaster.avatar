@@ -1,33 +1,7 @@
-[package]
-name = "keymaster-avatar"
-version = "0.1.0"
-edition = "2021"
-description = "KeyMaster Avatar - Nostr-based key service relay agent"
-
-[dependencies]
-# Nostr protocol
-nostr = { version = "0.37", features = ["std", "nip44"] }
-nostr-sdk = "0.37"
-
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# QR code display in terminal
-qrcode = "0.14"
-
-# Base64 encoding
-base64 = "0.22"
-
-# Error handling
-anyhow = "1"
+[workspace]
+resolver = "2"
+members = [
+    "crates/avatar",
+    "crates/avatar-protocol",
+    "crates/ssh-service-avatar",
+]

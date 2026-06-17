@@ -1,0 +1,32 @@
+[package]
+name = "ssh-service-avatar"
+version = "0.1.0"
+edition = "2021"
+description = "SSH Service Avatar - translates SSH-agent protocol to Avatar local API"
+
+[[bin]]
+name = "ssh-service-avatar"
+path = "src/main.rs"
+
+[dependencies]
+avatar-protocol = { path = "../avatar-protocol" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# Error handling
+anyhow = "1"
