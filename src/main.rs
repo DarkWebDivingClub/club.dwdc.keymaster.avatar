@@ -21,9 +21,9 @@ use crate::ssh_agent::{AgentIdentitiesReply, AgentRequest, AgentSignReply};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "iz-avatar",
+    name = "keymaster-avatar",
     version,
-    about = "IZ Avatar - Nostr-based key service relay agent"
+    about = "KeyMaster Avatar - Nostr-based key service relay agent"
 )]
 struct Cli {
     /// Nostr relay URL to connect to
@@ -35,11 +35,11 @@ struct Cli {
     log_level: String,
 
     /// SSH agent socket path
-    #[arg(long, default_value = "/tmp/iz-avatar-ssh-agent.sock")]
+    #[arg(long, default_value = "/tmp/keymaster-avatar-ssh-agent.sock")]
     agent_socket: PathBuf,
 
     /// GPG agent socket path
-    #[arg(long, default_value = "/tmp/iz-avatar-gpg-agent.sock")]
+    #[arg(long, default_value = "/tmp/keymaster-avatar-gpg-agent.sock")]
     gpg_agent_socket: PathBuf,
 }
 

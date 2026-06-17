@@ -1,8 +1,8 @@
 [package]
-name = "iz-avatar"
+name = "keymaster-avatar"
 version = "0.1.0"
 edition = "2021"
-description = "IZ Avatar - Nostr-based key service relay agent"
+description = "KeyMaster Avatar - Nostr-based key service relay agent"
 
 [dependencies]
 # Nostr protocol
