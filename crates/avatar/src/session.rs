@@ -3,15 +3,12 @@ use nostr::nips::nip44;
 use std::collections::HashMap;
 use tracing::{info, debug};
 
-/// A service channel within a session
+/// A service channel within a session.
+/// Keys are deterministically derived from xpubs — no spawn round-trip needed.
 pub struct ServiceChannel {
     pub service_type: String,
     pub service_avatar_keys: Keys,
-    pub spawn_event_id: EventId,
-    /// Set once KM responds with the service pubkey
-    pub km_service_pubkey: Option<PublicKey>,
-    /// Set once KM confirms spawn — the service session event ID
-    pub service_session_event_id: Option<EventId>,
+    pub km_service_pubkey: PublicKey,
 }
 
 /// A root session anchored by an attach event
@@ -61,15 +58,19 @@ impl SessionManager {
         session_id: EventId,
         service_type: String,
         service_avatar_keys: Keys,
-        spawn_event_id: EventId,
+        km_service_pubkey: PublicKey,
     ) {
         if let Some(session) = self.sessions.get_mut(&session_id) {
+            info!(
+                "Adding service channel: type={}, avatar_svc_pk={}, km_svc_pk={}",
+                service_type,
+                service_avatar_keys.public_key().to_hex(),
+                km_service_pubkey.to_hex()
+            );
             let channel = ServiceChannel {
                 service_type: service_type.clone(),
                 service_avatar_keys,
-                spawn_event_id,
-                km_service_pubkey: None,
-                service_session_event_id: None,
+                km_service_pubkey,
             };
             session.channels.insert(service_type, channel);
         }
@@ -94,65 +95,17 @@ impl SessionManager {
         session
     }
 
-    pub fn get_session(&self, session_id: &EventId) -> Option<&RootSession> {
-        self.sessions.get(session_id)
-    }
-
-    pub fn get_session_mut(&mut self, session_id: &EventId) -> Option<&mut RootSession> {
-        self.sessions.get_mut(session_id)
-    }
-
-    /// Find the SSH service channel keys and KM service pubkey (if channel is established)
-    pub fn find_ssh_channel(&self) -> Option<(Keys, PublicKey)> {
-        for session in self.sessions.values() {
-            if let Some(channel) = session.channels.get("ssh") {
-                if let Some(km_svc_pk) = channel.km_service_pubkey {
-                    return Some((channel.service_avatar_keys.clone(), km_svc_pk));
-                }
-            }
-        }
-        None
-    }
-
-    /// Find the GPG service channel keys and KM service pubkey (if channel is established)
-    pub fn find_gpg_channel(&self) -> Option<(Keys, PublicKey)> {
-        for session in self.sessions.values() {
-            if let Some(channel) = session.channels.get("gpg") {
-                if let Some(km_svc_pk) = channel.km_service_pubkey {
-                    return Some((channel.service_avatar_keys.clone(), km_svc_pk));
-                }
-            }
-        }
-        None
-    }
-
-    /// Find any service channel by type — used by local_api for service-agnostic forwarding
+    /// Find any service channel by type — returns the avatar keys and KM service pubkey.
     pub fn find_service_channel(&self, service_type: &str) -> Option<(Keys, PublicKey)> {
         for session in self.sessions.values() {
             if let Some(channel) = session.channels.get(service_type) {
-                if let Some(km_svc_pk) = channel.km_service_pubkey {
-                    return Some((channel.service_avatar_keys.clone(), km_svc_pk));
-                }
+                return Some((
+                    channel.service_avatar_keys.clone(),
+                    channel.km_service_pubkey,
+                ));
             }
         }
         None
-    }
-
-    /// Set the KM service pubkey for a service channel identified by the spawn event ID
-    pub fn set_km_service_pubkey(&mut self, spawn_event_id: &EventId, km_service_pubkey: PublicKey) {
-        for session in self.sessions.values_mut() {
-            for channel in session.channels.values_mut() {
-                if channel.spawn_event_id == *spawn_event_id {
-                    channel.km_service_pubkey = Some(km_service_pubkey);
-                    info!(
-                        "Set KM service pubkey for {} channel: {}",
-                        channel.service_type,
-                        km_service_pubkey.to_hex()
-                    );
-                    return;
-                }
-            }
-        }
     }
 
     /// Try to decrypt an event with any service channel keys

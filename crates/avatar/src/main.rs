@@ -1,21 +1,22 @@
-mod gpg_agent;
 mod local_api;
 mod protocol;
+mod seed;
 mod session;
 
 use anyhow::Result;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use avatar_protocol::{JsonRpcMessage, JsonRpcResponse};
+use bitcoin::bip32::{Xpriv, Xpub};
 use clap::Parser;
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::gpg_agent::{GpgAgentRequest, GpgKeyInfo, PkSignReply, RequestKeysReply};
-use crate::protocol::{Request, Response, PROTOCOL_KIND};
+use crate::protocol::PROTOCOL_KIND;
 use crate::session::SessionManager;
 
 #[derive(Parser, Debug)]
@@ -33,17 +34,31 @@ struct Cli {
     #[arg(long, default_value = "info")]
     log_level: String,
 
-    /// GPG agent socket path
-    #[arg(long, default_value = "/tmp/keymaster-avatar-gpg-agent.sock")]
-    gpg_agent_socket: PathBuf,
-
     /// Local API socket path (for service avatar processes)
     #[arg(long, default_value = "/tmp/keymaster-avatar.sock")]
     local_api_socket: PathBuf,
+
+    /// Path to the persistent seed file
+    #[arg(long, default_value = "~/.config/keymaster-avatar/seed")]
+    seed_file: String,
 }
 
-/// Pending response futures for service channel requests sent to KM
-pub type PendingResponses = Arc<RwLock<HashMap<EventId, oneshot::Sender<serde_json::Value>>>>;
+/// Pending response futures for service channel requests sent to KM.
+/// Value is the raw JSON-RPC response string from KM.
+pub type PendingResponses = Arc<RwLock<HashMap<EventId, oneshot::Sender<String>>>>;
+
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs_next_home() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+fn dirs_next_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -56,32 +71,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Generate avatar keypair
-    let avatar_keys = Keys::generate();
+    // Load or create persistent seed
+    let seed_path = expand_tilde(&cli.seed_file);
+    let seed = seed::load_or_create_seed(&seed_path)?;
+    info!("Seed loaded from: {}", seed_path.display());
+
+    // Derive login keys at m/0
+    let login_keys = seed::derive_login_keys(&seed, 0)?;
+    let avatar_keys = login_keys.nostr_keys.clone();
     let avatar_pubkey = avatar_keys.public_key();
+    let login_xpub = login_keys.xpub;
     info!("Avatar pubkey: {}", avatar_pubkey.to_hex());
+    info!("Login xpub: {}", login_xpub);
 
     // Display QR bootstrap payload
     let qr_payload = serde_json::json!({
-        "v": 1,
         "relay": &cli.relay,
-        "avatar_pubkey": avatar_pubkey.to_hex()
+        "login_xpub": login_xpub.to_string(),
+        "services": ["ssh"]
     });
     let qr_json = serde_json::to_string(&qr_payload)?;
     display_qr(&qr_json);
     println!("\nQR Payload: {}", qr_json);
     println!("Relay: {}", cli.relay);
     println!("Avatar pubkey: {}", avatar_pubkey.to_hex());
+    println!("Login xpub: {}", login_xpub);
     println!("\nWaiting for KeyMaster attach...\n");
 
     // Create session manager and pending response tracker
     let session_mgr = Arc::new(RwLock::new(SessionManager::new()));
     let pending_responses: PendingResponses = Arc::new(RwLock::new(HashMap::new()));
-
-    // Start GPG agent (legacy — stays bundled)
-    let (_gpg_agent_path, mut gpg_agent_rx) =
-        gpg_agent::start_gpg_agent(&cli.gpg_agent_socket).await?;
-    println!("GPG_AGENT_SOCK={}", cli.gpg_agent_socket.display());
 
     // Connect to relay
     let client = Client::new(avatar_keys.clone());
@@ -111,28 +130,8 @@ async fn main() -> Result<()> {
     .await?;
     println!("LOCAL_API_SOCK={}", cli.local_api_socket.display());
 
-    // Spawn the GPG agent bridge task (legacy — stays bundled)
-    let gpg_session_mgr = session_mgr.clone();
-    let gpg_pending = pending_responses.clone();
-    let gpg_keys = avatar_keys.clone();
-    let gpg_client = client.clone();
-
-    tokio::spawn(async move {
-        while let Some(request) = gpg_agent_rx.recv().await {
-            let session_mgr = gpg_session_mgr.clone();
-            let pending = gpg_pending.clone();
-            let keys = gpg_keys.clone();
-            let client = gpg_client.clone();
-
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_gpg_agent_request(request, &keys, &client, &session_mgr, &pending).await
-                {
-                    error!("Error handling GPG agent request: {}", e);
-                }
-            });
-        }
-    });
+    // Store login xpriv in an Arc for use in the event loop
+    let login_xpriv = Arc::new(login_keys.xpriv);
 
     // Event loop
     let event_pending = pending_responses.clone();
@@ -142,6 +141,7 @@ async fn main() -> Result<()> {
             let client_clone = client.clone();
             let session_mgr = session_mgr.clone();
             let pending = event_pending.clone();
+            let login_xpriv = login_xpriv.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
                             &client_clone,
                             &session_mgr,
                             &pending,
+                            &login_xpriv,
                             &event,
                         )
                         .await
@@ -167,180 +168,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_gpg_agent_request(
-    request: GpgAgentRequest,
-    _avatar_keys: &Keys,
-    client: &Client,
-    session_mgr: &Arc<RwLock<SessionManager>>,
-    pending: &PendingResponses,
-) -> Result<()> {
-    // Find GPG service channel
-    let channel_info = {
-        let mgr = session_mgr.read().await;
-        mgr.find_gpg_channel()
-    };
-
-    let (service_keys, km_service_pubkey) = match channel_info {
-        Some(info) => info,
-        None => {
-            warn!("No GPG service channel available");
-            match request {
-                GpgAgentRequest::RequestKeys { reply } => {
-                    let _ = reply.send(RequestKeysReply { keys: vec![] });
-                }
-                GpgAgentRequest::PkSign { reply, .. } => {
-                    let _ = reply.send(PkSignReply { signature: None });
-                }
-            }
-            return Ok(());
-        }
-    };
-
-    match request {
-        GpgAgentRequest::RequestKeys { reply } => {
-            info!("[GPG Agent] request_keys → forwarding to KM");
-            let req = Request {
-                method: "request_keys".to_string(),
-                params: vec![],
-            };
-            let event_id =
-                send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
-
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut p = pending.write().await;
-                p.insert(event_id, tx);
-            }
-
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                Ok(Ok(result)) => {
-                    let mut keys = Vec::new();
-                    if let Some(key_arr) = result.get("keys").and_then(|v| v.as_array()) {
-                        for k in key_arr {
-                            let keygrip = k
-                                .get("keygrip")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let n_b64 = k
-                                .get("n_b64")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            let e_b64 = k
-                                .get("e_b64")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            keys.push(GpgKeyInfo {
-                                keygrip,
-                                n_b64,
-                                e_b64,
-                            });
-                        }
-                    }
-                    info!("[GPG Agent] Got {} keys from KM", keys.len());
-                    let _ = reply.send(RequestKeysReply { keys });
-                }
-                Ok(Err(_)) => {
-                    error!("[GPG Agent] Response channel dropped");
-                    let _ = reply.send(RequestKeysReply { keys: vec![] });
-                }
-                Err(_) => {
-                    error!("[GPG Agent] Timeout waiting for keys from KM");
-                    let _ = reply.send(RequestKeysReply { keys: vec![] });
-                }
-            }
-        }
-        GpgAgentRequest::PkSign {
-            keygrip,
-            hash_algo,
-            hash_hex,
-            reply,
-        } => {
-            info!(
-                "[GPG Agent] pksign → forwarding to KM (keygrip={}, algo={})",
-                keygrip, hash_algo
-            );
-            let req = Request {
-                method: "pksign".to_string(),
-                params: vec![serde_json::json!({
-                    "keygrip": keygrip,
-                    "hash_algo": hash_algo,
-                    "hash_data": hash_hex,
-                })],
-            };
-            let event_id =
-                send_service_request(&service_keys, client, &km_service_pubkey, &req).await?;
-
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut p = pending.write().await;
-                p.insert(event_id, tx);
-            }
-
-            match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-                Ok(Ok(result)) => {
-                    let sig = result
-                        .get("signature")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| BASE64.decode(s).ok());
-                    if sig.is_some() {
-                        info!("[GPG Agent] Got signature from KM");
-                    } else {
-                        error!("[GPG Agent] Invalid signature from KM");
-                    }
-                    let _ = reply.send(PkSignReply { signature: sig });
-                }
-                Ok(Err(_)) => {
-                    error!("[GPG Agent] Response channel dropped");
-                    let _ = reply.send(PkSignReply { signature: None });
-                }
-                Err(_) => {
-                    error!("[GPG Agent] Timeout waiting for signature from KM");
-                    let _ = reply.send(PkSignReply { signature: None });
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Send a service channel request from Avatar's service keypair to KM's service keypair
-async fn send_service_request(
-    service_keys: &Keys,
-    client: &Client,
-    km_service_pubkey: &PublicKey,
-    request: &Request,
-) -> Result<EventId> {
-    let request_json = serde_json::to_string(request)?;
-    let encrypted = nip44::encrypt(
-        service_keys.secret_key(),
-        km_service_pubkey,
-        &request_json,
-        nip44::Version::V2,
-    )?;
-
-    let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
-        .tag(Tag::public_key(*km_service_pubkey))
-        .sign_with_keys(service_keys)?;
-
-    let event_id = event.id;
-    client.send_event(event).await?;
-    debug!(
-        "Sent service request {} to {}",
-        event_id,
-        km_service_pubkey.to_hex()
-    );
-    Ok(event_id)
-}
-
 async fn handle_event(
     avatar_keys: &Keys,
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
     pending: &PendingResponses,
+    login_xpriv: &Xpriv,
     event: &Event,
 ) -> Result<()> {
     let sender_pubkey = event.pubkey;
@@ -359,7 +192,11 @@ async fn handle_event(
             match mgr.try_decrypt_with_service_keys(&sender_pubkey, &event.content) {
                 Some(pt) => pt,
                 None => {
-                    debug!("Could not decrypt event {} from {}", event.id, sender_pubkey.to_hex());
+                    debug!(
+                        "Could not decrypt event {} from {}",
+                        event.id,
+                        sender_pubkey.to_hex()
+                    );
                     return Ok(());
                 }
             }
@@ -368,30 +205,36 @@ async fn handle_event(
 
     debug!("Decrypted content: {}", plaintext);
 
-    // Try parsing as response first (has result or error)
-    let json: serde_json::Value = serde_json::from_str(&plaintext)?;
+    // Parse as a generic JSON-RPC message
+    let msg: JsonRpcMessage = match serde_json::from_str(&plaintext) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Failed to parse JSON-RPC message: {}", e);
+            return Ok(());
+        }
+    };
 
-    if json.get("result").is_some() || json.get("error").is_some() {
-        // This is a response — check if it's a service.spawn response or a service channel response
-        handle_response(session_mgr, pending, event, &json).await
-    } else if json.get("method").is_some() {
-        // This is a request
-        let request: Request = serde_json::from_value(json)?;
+    if msg.is_response() {
+        // This is a response from KM — forward to waiting local API handler
+        handle_response(pending, event, &plaintext, &msg).await
+    } else if msg.is_request() {
+        let method = msg.method.as_deref().unwrap_or("");
         info!(
             "Received method: {} from {}",
-            request.method,
+            method,
             sender_pubkey.to_hex()
         );
 
-        match request.method.as_str() {
+        match method {
             "attach" => {
                 handle_attach(
                     avatar_keys,
                     client,
                     session_mgr,
+                    login_xpriv,
                     event,
                     &sender_pubkey,
-                    &request,
+                    &msg,
                 )
                 .await
             }
@@ -399,8 +242,9 @@ async fn handle_event(
                 handle_detach(avatar_keys, client, session_mgr, event, &sender_pubkey).await
             }
             _ => {
-                warn!("Unknown method: {}", request.method);
-                let response = Response::error("unknown method");
+                warn!("Unknown method: {}", method);
+                let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                let response = JsonRpcResponse::error(id, -32601, "unknown method");
                 send_response(avatar_keys, client, &sender_pubkey, &event.id, &response).await
             }
         }
@@ -411,10 +255,10 @@ async fn handle_event(
 }
 
 async fn handle_response(
-    session_mgr: &Arc<RwLock<SessionManager>>,
     pending: &PendingResponses,
     event: &Event,
-    json: &serde_json::Value,
+    plaintext: &str,
+    _msg: &JsonRpcMessage,
 ) -> Result<()> {
     // Find the reply-to event ID from e tags
     let reply_to = event.tags.iter().find_map(|tag| {
@@ -427,38 +271,15 @@ async fn handle_response(
     });
 
     if let Some(reply_to_id) = reply_to {
-        // Check if this is a response to a service.spawn request
-        {
-            let mut mgr = session_mgr.write().await;
-            if let Some(result) = json.get("result") {
-                if let Some(service_pubkey_hex) = result.get("service_pubkey").and_then(|v| v.as_str()) {
-                    // This is a service.spawn response — store KM's service pubkey
-                    if let Ok(km_svc_pk) = PublicKey::from_hex(service_pubkey_hex) {
-                        mgr.set_km_service_pubkey(&reply_to_id, km_svc_pk);
-                        info!(
-                            "Service channel established. KM service pubkey: {}",
-                            service_pubkey_hex
-                        );
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        // Check if this is a response to a pending service channel request
+        // Forward the raw JSON-RPC response to the pending local API handler
         let tx = {
             let mut p = pending.write().await;
             p.remove(&reply_to_id)
         };
 
         if let Some(tx) = tx {
-            if let Some(result) = json.get("result") {
-                let _ = tx.send(result.clone());
-                debug!("Delivered response for {}", reply_to_id);
-            } else if let Some(err) = json.get("error") {
-                error!("Service error response: {}", err);
-                let _ = tx.send(serde_json::json!({}));
-            }
+            let _ = tx.send(plaintext.to_string());
+            debug!("Delivered response for {}", reply_to_id);
         } else {
             debug!("Response to {} with no pending handler", reply_to_id);
         }
@@ -471,54 +292,59 @@ async fn handle_attach(
     avatar_keys: &Keys,
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
+    login_xpriv: &Xpriv,
     event: &Event,
     km_pubkey: &PublicKey,
-    request: &Request,
+    msg: &JsonRpcMessage,
 ) -> Result<()> {
     info!("=== ATTACH from KeyMaster {} ===", km_pubkey.to_hex());
 
-    let params = request
-        .params
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("attach: missing params"))?;
+    let params = if msg.params.is_array() {
+        msg.params
+            .as_array()
+            .and_then(|a| a.first())
+            .cloned()
+            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+    } else if msg.params.is_object() {
+        msg.params.clone()
+    } else {
+        serde_json::Value::Object(serde_json::Map::new())
+    };
 
-    // Parse services: accept both flat strings ["ssh"] and objects [{"service_type":"ssh"}]
-    let services = params
+    // Parse services from attach params
+    let services: Vec<(String, u32)> = params
         .get("services")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
                 .filter_map(|s| {
-                    // Try object format first: {"service_type": "ssh"}
-                    s.get("service_type")
-                        .and_then(|t| t.as_str())
-                        .map(String::from)
-                        // Fall back to flat string format: "ssh"
-                        .or_else(|| s.as_str().map(String::from))
+                    // Object format: {"type": "ssh", "seq": 0}
+                    if let Some(t) = s.get("type").and_then(|v| v.as_str()) {
+                        let seq = s.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+                        Some((t.to_string(), seq as u32))
+                    } else if let Some(t) = s.as_str() {
+                        // Flat string format: "ssh"
+                        Some((t.to_string(), 0))
+                    } else {
+                        None
+                    }
                 })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let identity = params
-        .get("identity")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string();
-
-    let alt_ids: Vec<String> = params
-        .get("alt_id")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|s| s.as_str().map(String::from))
                 .collect()
         })
         .unwrap_or_default();
 
+    // Extract connector if present
+    let identity = params
+        .get("connector")
+        .and_then(|c| c.get("identity_npub"))
+        .and_then(|v| v.as_str())
+        .or_else(|| params.get("identity").and_then(|v| v.as_str()))
+        .unwrap_or("default")
+        .to_string();
+
+    let service_types: Vec<String> = services.iter().map(|(t, _)| t.clone()).collect();
     info!("  Services: {:?}", services);
     info!("  Identity: {}", identity);
-    info!("  Alt IDs: {:?}", alt_ids);
 
     let attached_session_event_id = event.id;
     {
@@ -526,124 +352,94 @@ async fn handle_attach(
         mgr.create_root_session(
             attached_session_event_id,
             *km_pubkey,
-            services.clone(),
+            service_types.clone(),
             identity.clone(),
-            alt_ids.clone(),
+            vec![],
         );
     }
 
-    let response = Response::ok();
+    // Try to extract realm_xpub from connector params for BIP-32 channel derivation.
+    // Fall back to using event pubkey directly for backwards compat.
+    let realm_xpub: Option<Xpub> = params
+        .get("connector")
+        .and_then(|c| c.get("realm_xpub"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            Xpub::from_str(s)
+                .map_err(|e| warn!("Failed to parse realm_xpub: {}", e))
+                .ok()
+        });
+
+    // Derive and register service channels
+    for (service_type, seq) in &services {
+        // Derive avatar-side service keys from login_xpriv
+        let avatar_svc_keys = seed::derive_service_keys(login_xpriv, service_type, *seq)?;
+        let avatar_svc_pubkey = avatar_svc_keys.public_key();
+
+        // Derive KM-side service pubkey
+        let km_svc_pubkey = if let Some(ref rxpub) = realm_xpub {
+            // BIP-32 derivation: realm_xpub / protocol_index(type) / seq
+            seed::derive_service_pubkey(rxpub, service_type, *seq)?
+        } else {
+            // Backwards compat: use the event sender pubkey directly
+            warn!(
+                "No realm_xpub — using event pubkey for {} service channel (legacy mode)",
+                service_type
+            );
+            *km_pubkey
+        };
+
+        info!(
+            "  Service channel {}: avatar_svc_pk={}, km_svc_pk={}",
+            service_type,
+            avatar_svc_pubkey.to_hex(),
+            km_svc_pubkey.to_hex()
+        );
+
+        {
+            let mut mgr = session_mgr.write().await;
+            mgr.add_service_channel(
+                attached_session_event_id,
+                service_type.clone(),
+                avatar_svc_keys,
+                km_svc_pubkey,
+            );
+        }
+
+        // Subscribe to service channel events
+        let svc_filter = Filter::new()
+            .kind(Kind::Custom(PROTOCOL_KIND))
+            .pubkey(avatar_svc_pubkey)
+            .since(Timestamp::now());
+        client.subscribe(vec![svc_filter], None).await?;
+        info!(
+            "  Subscribed to service channel events for {}",
+            avatar_svc_pubkey.to_hex()
+        );
+    }
+
+    // Build accepted list
+    let accepted: Vec<serde_json::Value> = services
+        .iter()
+        .map(|(t, seq)| {
+            serde_json::json!({
+                "type": t,
+                "seq": seq,
+            })
+        })
+        .collect();
+
+    let id = msg.id.clone().unwrap_or(serde_json::Value::Number(1.into()));
+    let response = JsonRpcResponse::success(
+        id,
+        serde_json::json!({
+            "accepted": accepted,
+        }),
+    );
     send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
     info!(
         "Attach response sent. Session established: {}",
         attached_session_event_id
-    );
-
-    for service_type in &services {
-        info!("Spawning service channel for: {}", service_type);
-        spawn_service_channel(
-            avatar_keys,
-            client,
-            session_mgr,
-            km_pubkey,
-            &attached_session_event_id,
-            service_type,
-            &identity,
-            &alt_ids,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-async fn spawn_service_channel(
-    avatar_keys: &Keys,
-    client: &Client,
-    session_mgr: &Arc<RwLock<SessionManager>>,
-    km_pubkey: &PublicKey,
-    attached_session_event_id: &EventId,
-    service_type: &str,
-    identity: &str,
-    alt_ids: &[String],
-) -> Result<()> {
-    let service_avatar_keys = Keys::generate();
-    let service_avatar_pubkey = service_avatar_keys.public_key();
-
-    info!(
-        "  Service Avatar pubkey for {}: {}",
-        service_type,
-        service_avatar_pubkey.to_hex()
-    );
-
-    let mut allowed_identity = vec![identity.to_string()];
-    allowed_identity.extend(alt_ids.iter().cloned());
-
-    let methods: Vec<&str> = match service_type {
-        "ssh" => vec!["request_identities", "sign_request"],
-        "gpg" => vec!["request_keys", "pksign", "pksign_raw"],
-        "nostr" => vec![
-            "get_public_key",
-            "sign_event",
-            "nip44_encrypt",
-            "nip44_decrypt",
-        ],
-        _ => vec![],
-    };
-
-    let spawn_request = Request {
-        method: "service.spawn".to_string(),
-        params: vec![serde_json::json!({
-            "service_avatar_pubkey": service_avatar_pubkey.to_hex(),
-            "service_type": service_type,
-            "allowed_identity": allowed_identity,
-            "methods": methods,
-        })],
-    };
-
-    let request_json = serde_json::to_string(&spawn_request)?;
-    let encrypted = nip44::encrypt(
-        avatar_keys.secret_key(),
-        km_pubkey,
-        &request_json,
-        nip44::Version::V2,
-    )?;
-
-    let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
-        .tag(Tag::public_key(*km_pubkey))
-        .tag(Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
-            vec![
-                attached_session_event_id.to_hex(),
-                String::new(),
-                "session".to_string(),
-            ],
-        ))
-        .sign_with_keys(avatar_keys)?;
-
-    let spawn_event_id = event.id;
-    client.send_event(event).await?;
-    info!("  Sent service.spawn request (event: {})", spawn_event_id);
-
-    {
-        let mut mgr = session_mgr.write().await;
-        mgr.add_service_channel(
-            *attached_session_event_id,
-            service_type.to_string(),
-            service_avatar_keys,
-            spawn_event_id,
-        );
-    }
-
-    let svc_filter = Filter::new()
-        .kind(Kind::Custom(PROTOCOL_KIND))
-        .pubkey(service_avatar_pubkey)
-        .since(Timestamp::now());
-    client.subscribe(vec![svc_filter], None).await?;
-
-    info!(
-        "  Subscribed to service channel events for {}",
-        service_avatar_pubkey.to_hex()
     );
 
     Ok(())
@@ -671,7 +467,8 @@ async fn handle_detach(
         warn!("No active session found for {}", km_pubkey.to_hex());
     }
 
-    let response = Response::ok();
+    let id = serde_json::Value::Null;
+    let response = JsonRpcResponse::success(id, serde_json::json!({"status": "ok"}));
     send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
     info!("Detach response sent");
 
@@ -683,7 +480,7 @@ async fn send_response(
     client: &Client,
     recipient: &PublicKey,
     reply_to: &EventId,
-    response: &Response,
+    response: &JsonRpcResponse,
 ) -> Result<()> {
     let response_json = serde_json::to_string(response)?;
     let encrypted = nip44::encrypt(

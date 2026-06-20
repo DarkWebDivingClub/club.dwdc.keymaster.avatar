@@ -153,6 +153,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
 ]
 
@@ -600,6 +601,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpg-scdaemon"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,10 +850,27 @@ dependencies = [
  "anyhow",
  "avatar-protocol",
  "base64",
+ "bitcoin",
  "clap",
+ "getrandom",
  "nostr",
  "nostr-sdk",
  "qrcode",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "km-ssh-sa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "avatar-protocol",
+ "base64",
+ "clap",
  "serde",
  "serde_json",
  "tokio",
@@ -1107,6 +1134,15 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkcs11-gpg"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "poly1305"
@@ -1439,21 +1475,6 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ssh-service-avatar"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "avatar-protocol",
- "base64",
- "clap",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

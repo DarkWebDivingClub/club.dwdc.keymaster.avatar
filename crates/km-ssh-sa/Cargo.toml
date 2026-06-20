@@ -1,11 +1,11 @@
 [package]
-name = "ssh-service-avatar"
+name = "km-ssh-sa"
 version = "0.1.0"
 edition = "2021"
-description = "SSH Service Avatar - translates SSH-agent protocol to Avatar local API"
+description = "SSH Service Avatar - SSH-agent to Avatar local API bridge (JSON-RPC 2.0)"
 
 [[bin]]
-name = "ssh-service-avatar"
+name = "km-ssh-sa"
 path = "src/main.rs"
 
 [dependencies]

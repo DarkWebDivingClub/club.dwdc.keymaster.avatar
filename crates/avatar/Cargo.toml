@@ -35,5 +35,11 @@ qrcode = "0.14"
 # Base64 encoding
 base64 = "0.22"
 
+# BIP-32 key derivation (already in dep tree via nostr)
+bitcoin = { version = "0.32", features = ["std"] }
+
+# Cryptographic random seed generation
+getrandom = "0.2"
+
 # Error handling
 anyhow = "1"

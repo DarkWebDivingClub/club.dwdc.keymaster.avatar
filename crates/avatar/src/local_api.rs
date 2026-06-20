@@ -1,14 +1,20 @@
 use anyhow::Result;
-use avatar_protocol::{read_message, write_message, LocalRequest, LocalResponse};
+use avatar_protocol::{
+    read_line_message, write_line_message, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
+    JSONRPC_INTERNAL_ERROR, JSONRPC_NO_SESSION, JSONRPC_SEND_FAILED,
+    JSONRPC_TIMEOUT, JSONRPC_CHANNEL_DROPPED,
+};
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::{Request, PROTOCOL_KIND};
+use crate::protocol::PROTOCOL_KIND;
 use crate::session::SessionManager;
 use crate::PendingResponses;
 
@@ -54,11 +60,12 @@ async fn handle_connection(
     session_mgr: Arc<RwLock<SessionManager>>,
     pending: PendingResponses,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
     let mut bound_service: Option<String> = None;
 
     loop {
-        let req: LocalRequest = match read_message(&mut reader).await {
+        let msg: JsonRpcMessage = match read_line_message(&mut reader).await {
             Ok(r) => r,
             Err(e) => {
                 debug!("Local API: connection closed ({})", e);
@@ -66,51 +73,116 @@ async fn handle_connection(
             }
         };
 
-        debug!(
-            "Local API: request_id={} service={} op={}",
-            req.request_id, req.service, req.operation
-        );
+        // Must be a request (has method)
+        if !msg.is_request() {
+            debug!("Local API: ignoring non-request message");
+            continue;
+        }
 
-        // First-request-allocates: bind the connection to a service type
-        match &bound_service {
-            None => {
-                info!("Local API: binding connection to service '{}'", req.service);
-                bound_service = Some(req.service.clone());
-            }
-            Some(svc) if *svc != req.service => {
-                let resp = LocalResponse::error(
-                    req.request_id,
-                    format!("connection bound to '{}', got '{}'", svc, req.service),
+        let method = msg.method.as_deref().unwrap_or("");
+        let id = msg.id.clone().unwrap_or(Value::Null);
+        let params = msg.params.clone();
+
+        debug!("Local API: method={} id={}", method, id);
+
+        // Handle connect (first message — binds this connection to a service)
+        if method == "connect" {
+            let svc_type = params
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let npub = params
+                .get("npub")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            if svc_type.is_empty() {
+                let resp = JsonRpcResponse::error(
+                    id,
+                    JSONRPC_INTERNAL_ERROR,
+                    "connect requires 'type' param",
                 );
-                if write_message(&mut writer, &resp).await.is_err() {
+                if write_line_message(&mut writer, &resp).await.is_err() {
                     return;
                 }
                 continue;
             }
-            _ => {}
+
+            info!(
+                "Local API: connect type={} npub={}",
+                svc_type,
+                if npub.is_empty() { "<none>" } else { &npub }
+            );
+            bound_service = Some(svc_type.clone());
+
+            let resp = JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "npub": npub,
+                }),
+            );
+            if write_line_message(&mut writer, &resp).await.is_err() {
+                return;
+            }
+            continue;
         }
 
-        let resp =
-            handle_local_request(&req, &avatar_keys, &client, &session_mgr, &pending).await;
+        // All other methods require a prior connect
+        let service_type = match &bound_service {
+            Some(s) => s.clone(),
+            None => {
+                let resp = JsonRpcResponse::error(
+                    id,
+                    JSONRPC_INTERNAL_ERROR,
+                    "must send 'connect' first",
+                );
+                if write_line_message(&mut writer, &resp).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
 
-        if write_message(&mut writer, &resp).await.is_err() {
+        // Forward the JSON-RPC request to Nostr as-is
+        let resp = forward_to_nostr(
+            &service_type,
+            &JsonRpcRequest {
+                jsonrpc: "2.0".to_string(),
+                method: method.to_string(),
+                params,
+                id: Some(id.clone()),
+            },
+            &avatar_keys,
+            &client,
+            &session_mgr,
+            &pending,
+        )
+        .await;
+
+        if write_line_message(&mut writer, &resp).await.is_err() {
             error!("Local API: write error");
             return;
         }
     }
 }
 
-async fn handle_local_request(
-    req: &LocalRequest,
+/// Forward a JSON-RPC request to the Nostr service channel and wait for the response.
+async fn forward_to_nostr(
+    service_type: &str,
+    request: &JsonRpcRequest,
     _avatar_keys: &Keys,
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
     pending: &PendingResponses,
-) -> LocalResponse {
-    // Find the service channel for the requested service type
+) -> JsonRpcResponse {
+    let id = request.id.clone().unwrap_or(Value::Null);
+
+    // Find the service channel
     let channel_info = {
         let mgr = session_mgr.read().await;
-        mgr.find_service_channel(&req.service)
+        mgr.find_service_channel(service_type)
     };
 
     let (service_keys, km_service_pubkey) = match channel_info {
@@ -118,30 +190,31 @@ async fn handle_local_request(
         None => {
             warn!(
                 "Local API: no service channel for '{}' (not yet established?)",
-                req.service
+                service_type
             );
-            return LocalResponse::error(req.request_id, "no service channel available");
+            return JsonRpcResponse::error(id, JSONRPC_NO_SESSION, "no service channel available");
         }
     };
 
-    // Build a Nostr Request from the local API request
-    let nostr_req = Request {
-        method: req.operation.clone(),
-        params: if req.payload.is_null() {
-            vec![]
-        } else {
-            vec![req.payload.clone()]
-        },
+    // Send the JSON-RPC request as-is (encrypted) on the service channel
+    let request_json = match serde_json::to_string(request) {
+        Ok(j) => j,
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                JSONRPC_INTERNAL_ERROR,
+                format!("serialize error: {}", e),
+            );
+        }
     };
 
-    // Send the request on the service channel
-    let event_id = match send_service_request(&service_keys, client, &km_service_pubkey, &nostr_req)
+    let event_id = match send_service_request(&service_keys, client, &km_service_pubkey, &request_json)
         .await
     {
-        Ok(id) => id,
+        Ok(eid) => eid,
         Err(e) => {
             error!("Local API: send error: {}", e);
-            return LocalResponse::error(req.request_id, "failed to send request");
+            return JsonRpcResponse::error(id, JSONRPC_SEND_FAILED, "failed to send request");
         }
     };
 
@@ -153,36 +226,58 @@ async fn handle_local_request(
     }
 
     match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-        Ok(Ok(result)) => {
-            debug!("Local API: got response for request_id={}", req.request_id);
-            LocalResponse::success(req.request_id, result)
+        Ok(Ok(response_json)) => {
+            // The response is already a complete JSON-RPC response string from KM.
+            // Parse it and forward as-is.
+            match serde_json::from_str::<JsonRpcResponse>(&response_json) {
+                Ok(resp) => {
+                    debug!("Local API: got response for id={}", id);
+                    resp
+                }
+                Err(_) => {
+                    // If it's not a valid JSON-RPC response, wrap the raw value
+                    match serde_json::from_str::<Value>(&response_json) {
+                        Ok(val) => {
+                            if val.get("result").is_some() || val.get("error").is_some() {
+                                // Looks like a response but didn't parse cleanly, forward the raw value
+                                JsonRpcResponse::success(id, val)
+                            } else {
+                                JsonRpcResponse::success(id, val)
+                            }
+                        }
+                        Err(e) => JsonRpcResponse::error(
+                            id,
+                            JSONRPC_INTERNAL_ERROR,
+                            format!("invalid response: {}", e),
+                        ),
+                    }
+                }
+            }
         }
         Ok(Err(_)) => {
             error!("Local API: response channel dropped");
-            LocalResponse::error(req.request_id, "response channel dropped")
+            JsonRpcResponse::error(id, JSONRPC_CHANNEL_DROPPED, "response channel dropped")
         }
         Err(_) => {
             error!("Local API: timeout waiting for response");
-            // Clean up the pending entry
             let mut p = pending.write().await;
             p.remove(&event_id);
-            LocalResponse::error(req.request_id, "timeout")
+            JsonRpcResponse::error(id, JSONRPC_TIMEOUT, "timeout")
         }
     }
 }
 
-/// Send a service channel request from Avatar's service keypair to KM's service keypair.
+/// Send an encrypted JSON-RPC request on the service channel.
 async fn send_service_request(
     service_keys: &Keys,
     client: &Client,
     km_service_pubkey: &PublicKey,
-    request: &Request,
+    request_json: &str,
 ) -> Result<EventId> {
-    let request_json = serde_json::to_string(request)?;
     let encrypted = nip44::encrypt(
         service_keys.secret_key(),
         km_service_pubkey,
-        &request_json,
+        request_json,
         nip44::Version::V2,
     )?;
 
