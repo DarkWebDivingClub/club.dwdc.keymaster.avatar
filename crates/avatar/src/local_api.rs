@@ -185,7 +185,7 @@ async fn forward_to_nostr(
         mgr.find_service_channel(service_type)
     };
 
-    let (service_keys, km_service_pubkey) = match channel_info {
+    let (service_keys, km_service_pubkey, km_realm_pubkey) = match channel_info {
         Some(info) => info,
         None => {
             warn!(
@@ -208,8 +208,14 @@ async fn forward_to_nostr(
         }
     };
 
-    let event_id = match send_service_request(&service_keys, client, &km_service_pubkey, &request_json)
-        .await
+    let event_id = match send_service_request(
+        &service_keys,
+        client,
+        &km_service_pubkey,
+        &km_realm_pubkey,
+        &request_json,
+    )
+    .await
     {
         Ok(eid) => eid,
         Err(e) => {
@@ -272,6 +278,7 @@ async fn send_service_request(
     service_keys: &Keys,
     client: &Client,
     km_service_pubkey: &PublicKey,
+    km_realm_pubkey: &PublicKey,
     request_json: &str,
 ) -> Result<EventId> {
     let encrypted = nip44::encrypt(
@@ -283,6 +290,10 @@ async fn send_service_request(
 
     let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
         .tag(Tag::public_key(*km_service_pubkey))
+        .tag(Tag::custom(
+            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)),
+            vec![km_realm_pubkey.to_hex(), String::new(), "realm".to_string()],
+        ))
         .sign_with_keys(service_keys)?;
 
     let event_id = event.id;

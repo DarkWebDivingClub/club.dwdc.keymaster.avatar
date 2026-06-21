@@ -1,0 +1,18 @@
+[package]
+name = "km-gpg-sa"
+version = "0.1.0"
+edition = "2021"
+description = "GPG Service Avatar - GPG environment setup and Assuan-to-JSON-RPC proxy"
+
+[[bin]]
+name = "km-gpg-sa"
+path = "src/main.rs"
+
+[dependencies]
+avatar-protocol = { path = "../avatar-protocol" }
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+anyhow = "1"

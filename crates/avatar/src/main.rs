@@ -6,14 +6,17 @@ mod session;
 use anyhow::Result;
 use avatar_protocol::{JsonRpcMessage, JsonRpcResponse};
 use bitcoin::bip32::{Xpriv, Xpub};
+use bitcoin::hashes::{sha256, Hash};
+use bitcoin::hex::FromHex;
+use bitcoin::secp256k1::{Secp256k1, schnorr::Signature as SchnorrSignature};
 use clap::Parser;
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, watch, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::protocol::PROTOCOL_KIND;
@@ -41,6 +44,10 @@ struct Cli {
     /// Path to the persistent seed file
     #[arg(long, default_value = "~/.config/keymaster-avatar/seed")]
     seed_file: String,
+
+    /// Path to identity allowlist file (one hex npub per line)
+    #[arg(long, default_value = "~/.config/keymaster-avatar/allowlist")]
+    allowlist: String,
 }
 
 /// Pending response futures for service channel requests sent to KM.
@@ -60,6 +67,25 @@ fn dirs_next_home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Load identity allowlist from file.
+/// One hex npub per line; empty lines and lines starting with '#' are skipped.
+/// If the file is missing or empty, returns an empty set (allow all).
+fn load_allowlist(path: &std::path::Path) -> HashSet<String> {
+    let mut set = HashSet::new();
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return set,
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        set.insert(trimmed.to_string());
+    }
+    set
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -70,6 +96,16 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level)),
         )
         .init();
+
+    // Load identity allowlist
+    let allowlist_path = expand_tilde(&cli.allowlist);
+    let allowlist = load_allowlist(&allowlist_path);
+    if allowlist.is_empty() {
+        info!("No identity allowlist (all identities accepted)");
+    } else {
+        info!("Identity allowlist loaded: {} entries from {}", allowlist.len(), allowlist_path.display());
+    }
+    let allowlist = Arc::new(allowlist);
 
     // Load or create persistent seed
     let seed_path = expand_tilde(&cli.seed_file);
@@ -108,14 +144,16 @@ async fn main() -> Result<()> {
     client.connect().await;
     info!("Connected to relay: {}", cli.relay);
 
-    // Subscribe to events addressed to us
+    // Subscribe to events addressed to us via explicit #p filter.
+    // With "login" marker p tags on all KM→Avatar service responses,
+    // this single subscription catches both root and service channel events.
     let filter = Filter::new()
         .kind(Kind::Custom(PROTOCOL_KIND))
-        .pubkey(avatar_pubkey)
+        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), [avatar_pubkey.to_hex()])
         .since(Timestamp::now());
 
     client.subscribe(vec![filter], None).await?;
-    info!("Subscribed to kind {} events for our pubkey", PROTOCOL_KIND);
+    info!("Subscribed to kind {} events for #p={}", PROTOCOL_KIND, avatar_pubkey.to_hex());
 
     // Start local API listener for service avatar processes
     let avatar_keys_arc = Arc::new(avatar_keys.clone());
@@ -130,8 +168,10 @@ async fn main() -> Result<()> {
     .await?;
     println!("LOCAL_API_SOCK={}", cli.local_api_socket.display());
 
-    // Store login xpriv in an Arc for use in the event loop
+    // Store login keys in Arcs for use in the event loop
     let login_xpriv = Arc::new(login_keys.xpriv);
+    let login_xpub_arc = Arc::new(login_xpub);
+    let local_api_socket = Arc::new(cli.local_api_socket.clone());
 
     // Event loop
     let event_pending = pending_responses.clone();
@@ -142,6 +182,9 @@ async fn main() -> Result<()> {
             let session_mgr = session_mgr.clone();
             let pending = event_pending.clone();
             let login_xpriv = login_xpriv.clone();
+            let login_xpub = login_xpub_arc.clone();
+            let allowlist = allowlist.clone();
+            let local_api_socket = local_api_socket.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
@@ -152,6 +195,9 @@ async fn main() -> Result<()> {
                             &session_mgr,
                             &pending,
                             &login_xpriv,
+                            &login_xpub,
+                            &allowlist,
+                            &local_api_socket,
                             &event,
                         )
                         .await
@@ -174,6 +220,9 @@ async fn handle_event(
     session_mgr: &Arc<RwLock<SessionManager>>,
     pending: &PendingResponses,
     login_xpriv: &Xpriv,
+    login_xpub: &Xpub,
+    allowlist: &HashSet<String>,
+    local_api_socket: &std::path::Path,
     event: &Event,
 ) -> Result<()> {
     let sender_pubkey = event.pubkey;
@@ -232,6 +281,9 @@ async fn handle_event(
                     client,
                     session_mgr,
                     login_xpriv,
+                    login_xpub,
+                    allowlist,
+                    local_api_socket,
                     event,
                     &sender_pubkey,
                     &msg,
@@ -293,6 +345,9 @@ async fn handle_attach(
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
     login_xpriv: &Xpriv,
+    login_xpub: &Xpub,
+    allowlist: &HashSet<String>,
+    local_api_socket: &std::path::Path,
     event: &Event,
     km_pubkey: &PublicKey,
     msg: &JsonRpcMessage,
@@ -346,6 +401,114 @@ async fn handle_attach(
     info!("  Services: {:?}", services);
     info!("  Identity: {}", identity);
 
+    // --- Connector signature verification ---
+    if let Some(connector) = params.get("connector") {
+        // Verify login_xpub matches ours
+        if let Some(login_xpub_str) = connector.get("login_xpub").and_then(|v| v.as_str()) {
+            if login_xpub_str != login_xpub.to_string() {
+                warn!(
+                    "Connector login_xpub mismatch: got {} expected {}",
+                    login_xpub_str, login_xpub
+                );
+                let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                let response = JsonRpcResponse::error(id, -32602, "login_xpub mismatch");
+                send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+                return Ok(());
+            }
+        }
+
+        // Verify realm_xpub sender matches event pubkey
+        if let Some(realm_xpub_str) = connector.get("realm_xpub").and_then(|v| v.as_str()) {
+            if let Ok(rxpub) = Xpub::from_str(realm_xpub_str) {
+                let realm_pk_bytes = &rxpub.public_key.serialize()[1..]; // x-only from compressed
+                let sender_bytes = event.pubkey.serialize();
+                if realm_pk_bytes != sender_bytes {
+                    warn!("Connector realm_xpub does not match event sender");
+                    let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                    let response =
+                        JsonRpcResponse::error(id, -32602, "realm_xpub sender mismatch");
+                    send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Verify Schnorr signature over canonical connector
+        if let Some(sig_hex) = params.get("connector_sig").and_then(|v| v.as_str()) {
+            let canonical = canonicalize_json(connector);
+            let hash = sha256::Hash::hash(canonical.as_bytes());
+            let msg_obj =
+                secp256k1::Message::from_digest(*hash.as_ref());
+
+            let sig_bytes = match Vec::<u8>::from_hex(sig_hex) {
+                Ok(b) if b.len() == 64 => b,
+                _ => {
+                    warn!("Invalid connector_sig hex");
+                    let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                    let response =
+                        JsonRpcResponse::error(id, -32602, "invalid connector_sig");
+                    send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+                    return Ok(());
+                }
+            };
+
+            let sig = match SchnorrSignature::from_slice(&sig_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!("Failed to parse connector_sig");
+                    let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                    let response =
+                        JsonRpcResponse::error(id, -32602, "invalid connector_sig");
+                    send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+                    return Ok(());
+                }
+            };
+
+            let identity_npub_hex = connector
+                .get("identity_npub")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let identity_pk_bytes = match Vec::<u8>::from_hex(identity_npub_hex) {
+                Ok(b) if b.len() == 32 => b,
+                _ => {
+                    warn!("Invalid identity_npub in connector");
+                    let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                    let response =
+                        JsonRpcResponse::error(id, -32602, "invalid identity_npub");
+                    send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+                    return Ok(());
+                }
+            };
+
+            let secp = Secp256k1::verification_only();
+            let xonly =
+                bitcoin::secp256k1::XOnlyPublicKey::from_slice(&identity_pk_bytes)?;
+            if secp.verify_schnorr(&sig, &msg_obj, &xonly).is_err() {
+                warn!("Connector signature verification FAILED");
+                let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+                let response =
+                    JsonRpcResponse::error(id, -32602, "connector signature verification failed");
+                send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+                return Ok(());
+            }
+            info!("  Connector signature verified OK");
+        } else {
+            warn!("No connector_sig present — legacy attach (unverified)");
+        }
+    }
+
+    // --- Identity allowlist check ---
+    if !allowlist.is_empty() && !allowlist.contains(&identity) {
+        warn!("Identity {} not in allowlist — rejecting attach", identity);
+        let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
+        let response = JsonRpcResponse::error(id, -32602, "identity not in allowlist");
+        send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+        return Ok(());
+    }
+
+    // Create shutdown channel for service process monitors
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     let attached_session_event_id = event.id;
     {
         let mut mgr = session_mgr.write().await;
@@ -355,6 +518,7 @@ async fn handle_attach(
             service_types.clone(),
             identity.clone(),
             vec![],
+            Some(shutdown_tx),
         );
     }
 
@@ -403,19 +567,20 @@ async fn handle_attach(
                 service_type.clone(),
                 avatar_svc_keys,
                 km_svc_pubkey,
+                *km_pubkey,
             );
         }
 
-        // Subscribe to service channel events
-        let svc_filter = Filter::new()
-            .kind(Kind::Custom(PROTOCOL_KIND))
-            .pubkey(avatar_svc_pubkey)
-            .since(Timestamp::now());
-        client.subscribe(vec![svc_filter], None).await?;
-        info!(
-            "  Subscribed to service channel events for {}",
-            avatar_svc_pubkey.to_hex()
-        );
+        // No per-service subscription needed — root #p subscription catches
+        // all events via "login" marker p tag on KM→Avatar responses.
+    }
+
+    // Spawn service process monitors for each service (km-{type}-sa binaries).
+    for (service_type, _seq) in &services {
+        let svc = service_type.clone();
+        let socket = local_api_socket.to_path_buf();
+        let rx = shutdown_rx.clone();
+        tokio::spawn(service_monitor(svc, socket, rx));
     }
 
     // Build accepted list
@@ -505,6 +670,87 @@ async fn send_response(
         reply_to
     );
     Ok(())
+}
+
+/// Spawn a service avatar process (e.g. km-ssh-sa).
+/// Binary name: km-{service_type}-sa, found via PATH.
+async fn spawn_service_avatar(
+    service_type: &str,
+    avatar_socket: &std::path::Path,
+) -> Result<tokio::process::Child> {
+    let binary = format!("km-{}-sa", service_type);
+    info!("Spawning service process: {} (socket: {})", binary, avatar_socket.display());
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.arg("--avatar-socket")
+        .arg(avatar_socket)
+        .arg("--log-level")
+        .arg("debug")
+        .kill_on_drop(true);
+    // Pass GNUPGHOME so km-gpg-sa knows where to set up GPG
+    if let Ok(gnupg_home) = std::env::var("GNUPGHOME") {
+        cmd.env("GNUPGHOME", &gnupg_home);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", binary, e))?;
+    Ok(child)
+}
+
+/// Monitor a service process: respawn on crash, stop on shutdown signal.
+async fn service_monitor(
+    service_type: String,
+    avatar_socket: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    loop {
+        let mut child = match spawn_service_avatar(&service_type, &avatar_socket).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to spawn {}: {}", service_type, e);
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        tokio::select! {
+            status = child.wait() => {
+                match status {
+                    Ok(s) => warn!("Service process {} exited: {}", service_type, s),
+                    Err(e) => error!("Service process {} error: {}", service_type, e),
+                }
+                // Respawn after brief delay
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            _ = shutdown.changed() => {
+                info!("Shutdown signal for service {}, killing process", service_type);
+                let _ = child.kill().await;
+                return;
+            }
+        }
+    }
+}
+
+/// Canonical JSON: sort keys lexicographically, compact output.
+/// Must match Java `canonicalizeJson()` byte-for-byte.
+fn canonicalize_json(obj: &serde_json::Value) -> String {
+    if let Some(map) = obj.as_object() {
+        let sorted: std::collections::BTreeMap<&String, &serde_json::Value> =
+            map.iter().collect();
+        let parts: Vec<String> = sorted
+            .iter()
+            .map(|(k, v)| {
+                let key = serde_json::to_string(*k).unwrap();
+                let val = match v {
+                    serde_json::Value::Object(_) => canonicalize_json(v),
+                    _ => serde_json::to_string(v).unwrap(),
+                };
+                format!("{}:{}", key, val)
+            })
+            .collect();
+        format!("{{{}}}", parts.join(","))
+    } else {
+        serde_json::to_string(obj).unwrap()
+    }
 }
 
 fn display_qr(data: &str) {

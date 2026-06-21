@@ -1,27 +1,27 @@
-// Custom GnuPG scdaemon for KeyMaster Avatar.
+// scd-shim: Thin Assuan-to-JSON-RPC translator for KeyMaster Avatar.
 //
 // Speaks the GnuPG Assuan protocol (stdin/stdout) and communicates with
-// the avatar's local API over a Unix socket. This replaces gnupg-pkcs11-scd
-// which does not support Ed25519/EdDSA keys.
+// km-gpg-sa over a Unix socket (JSON-RPC 2.0). This replaces the direct
+// avatar API connection that iz-scdaemon used.
 //
 // gpg-agent starts this binary as its scdaemon. The flow:
-// 1. Connect to avatar local API, fetch identities + GPG public cert
-// 2. Import cert into GPG synchronously (gpg --no-autostart --import)
-// 3. Extract keygrips from GPG (matching libgcrypt's computation)
+// 1. Connect to km-gpg-sa proxy socket (no avatar handshake needed)
+// 2. Fetch identities via gpg.request_identities
+// 3. Compute keygrips (matching libgcrypt's algorithm exactly)
 // 4. Handle Assuan commands: SERIALNO, LEARN, READKEY, SETDATA, PKSIGN, etc.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
+use sha1::{Sha1, Digest};
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::Duration;
 
-const DEFAULT_SOCKET: &str = "/tmp/keymaster-avatar.sock";
+const DEFAULT_SOCKET: &str = "/tmp/keymaster-avatar-gpg.sock";
 const SERIAL: &str = "D2760001240103000000000000000100";
 
-// ---- Local API client (adapted from pkcs11-gpg/local_client.rs) ----
+// ---- km-gpg-sa JSON-RPC client ----
 
 #[derive(Debug, Deserialize)]
 struct RawIdentity {
@@ -30,14 +30,16 @@ struct RawIdentity {
     label: String,
 }
 
-struct LocalClient {
+/// Simple synchronous JSON-RPC client that connects to the km-gpg-sa proxy
+/// socket. No avatar `connect` handshake — the proxy speaks raw JSON-RPC.
+struct GpgSaClient {
     reader: io::BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
 }
 
-impl LocalClient {
-    fn connect(socket_path: &Path) -> Result<Self, String> {
+impl GpgSaClient {
+    fn connect(socket_path: &std::path::Path) -> Result<Self, String> {
         let stream = UnixStream::connect(socket_path)
             .map_err(|e| format!("connect to {}: {}", socket_path.display(), e))?;
         stream
@@ -52,58 +54,21 @@ impl LocalClient {
             .map_err(|e| format!("clone stream: {}", e))?;
         let reader = io::BufReader::new(stream);
 
-        let mut client = LocalClient {
+        Ok(GpgSaClient {
             reader,
             writer,
             next_id: 1,
-        };
-
-        // Send connect handshake (required by local API)
-        client.send_connect()?;
-
-        Ok(client)
-    }
-
-    fn send_connect(&mut self) -> Result<(), String> {
-        let req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "connect",
-            "params": { "type": "gpg" },
-            "id": self.next_id,
-        });
-        self.next_id += 1;
-
-        let mut data = serde_json::to_vec(&req).map_err(|e| format!("serialize: {}", e))?;
-        data.push(b'\n');
-        self.writer
-            .write_all(&data)
-            .map_err(|e| format!("write connect: {}", e))?;
-        self.writer
-            .flush()
-            .map_err(|e| format!("flush connect: {}", e))?;
-
-        let mut line = String::new();
-        self.reader
-            .read_line(&mut line)
-            .map_err(|e| format!("read connect response: {}", e))?;
-
-        let resp: serde_json::Value = serde_json::from_str(line.trim_end())
-            .map_err(|e| format!("parse connect response: {}", e))?;
-
-        if resp.get("error").is_some() {
-            return Err("connect handshake failed".into());
-        }
-        Ok(())
+        })
     }
 
     fn request(
         &mut self,
-        operation: &str,
+        method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let req = serde_json::json!({
             "jsonrpc": "2.0",
-            "method": format!("gpg.{}", operation),
+            "method": method,
             "params": params,
             "id": self.next_id,
         });
@@ -131,7 +96,7 @@ impl LocalClient {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown error");
-            return Err(format!("avatar error: {}", message));
+            return Err(format!("proxy error: {}", message));
         }
 
         Ok(resp
@@ -141,7 +106,7 @@ impl LocalClient {
     }
 
     fn request_identities(&mut self) -> Result<Vec<RawIdentity>, String> {
-        let payload = self.request("request_identities", serde_json::json!({}))?;
+        let payload = self.request("gpg.request_identities", serde_json::json!({}))?;
         let identities_val = payload
             .get("identities")
             .ok_or("missing 'identities' in response")?;
@@ -149,18 +114,9 @@ impl LocalClient {
             .map_err(|e| format!("parse identities: {}", e))
     }
 
-    fn get_public_cert(&mut self) -> Result<String, String> {
-        let payload = self.request("get_public_cert", serde_json::json!({}))?;
-        payload
-            .get("public_cert_armor")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .ok_or_else(|| "missing 'public_cert_armor' in response".into())
-    }
-
     fn sign(&mut self, key_index: usize, public_key: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
         let payload = self.request(
-            "sign_request",
+            "gpg.sign_request",
             serde_json::json!({
                 "key_index": key_index,
                 "public_key": BASE64.encode(public_key),
@@ -178,6 +134,29 @@ impl LocalClient {
     }
 }
 
+/// Find the km-gpg-sa proxy socket path.
+/// Priority: KM_GPG_SA_SOCKET env → {GNUPGHOME}/km-gpg-sa.socket file → default.
+fn find_socket_path() -> PathBuf {
+    // 1. Explicit env var
+    if let Ok(path) = std::env::var("KM_GPG_SA_SOCKET") {
+        return PathBuf::from(path);
+    }
+
+    // 2. Read from GNUPGHOME/km-gpg-sa.socket file (written by km-gpg-sa)
+    if let Ok(gnupg_home) = std::env::var("GNUPGHOME") {
+        let socket_file = PathBuf::from(&gnupg_home).join("km-gpg-sa.socket");
+        if let Ok(contents) = std::fs::read_to_string(&socket_file) {
+            let path = contents.trim();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+
+    // 3. Default
+    PathBuf::from(DEFAULT_SOCKET)
+}
+
 // ---- Identity ----
 
 struct Identity {
@@ -187,7 +166,8 @@ struct Identity {
     keyref: String,  // e.g. "OPENPGP.1"
 }
 
-/// Build the canonical S-expression for a full Ed25519 public key.
+/// Build the canonical S-expression for a full Ed25519 public key,
+/// used in the READKEY response (Assuan protocol).
 ///   (10:public-key(3:ecc(5:curve7:Ed25519)(5:flags5:eddsa)(1:q33:\x40<pubkey>)))
 fn public_key_sexp(public_key: &[u8]) -> Vec<u8> {
     let mut sexp = Vec::with_capacity(80);
@@ -196,6 +176,89 @@ fn public_key_sexp(public_key: &[u8]) -> Vec<u8> {
     sexp.extend_from_slice(public_key);
     sexp.extend_from_slice(b")))");
     sexp
+}
+
+/// Compute keygrip from an Ed25519 public key, matching libgcrypt's
+/// algorithm exactly.
+///
+/// libgcrypt computes ECC keygrips by SHA-1 hashing the curve parameters
+/// (p, a, b, g, n) plus the public key point (q), each wrapped in
+/// canonical S-expression notation:
+///   `(1:p<len>:<bytes>)(1:a<len>:<bytes>)...(1:q<len>:<bytes>)`
+///
+/// For Ed25519, the parameters are hardcoded from libgcrypt's curve table:
+///   p = 2^255 - 19
+///   a = 1 (absolute value of -1)
+///   b = |d| where d = -121665/121666
+///   g = 0x04 || y || x (uncompressed SEC1 generator point)
+///   n = group order
+///   q = 0x40 || public_key (EdDSA native format)
+fn compute_keygrip(public_key: &[u8]) -> String {
+    // Ed25519 curve parameters (from libgcrypt ecc-curves.c).
+    // Verified empirically against libgcrypt 1.10/1.12 gcry_pk_get_keygrip.
+    //
+    // p = 2^255 - 19
+    let p: [u8; 32] = [
+        0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xED,
+    ];
+    // a = |−1| = 0x01 (absolute value; libgcrypt's _gcry_mpi_get_buffer
+    // returns unsigned representation, so negative sign is dropped)
+    let a: [u8; 1] = [0x01];
+    // b = |d| where d = −121665/121666 mod p
+    //   = 0x2DFC9311D490018C7338BF8688861767FF8FF5B2BEBE27548A14B235ECA6874A
+    let b: [u8; 32] = [
+        0x2D, 0xFC, 0x93, 0x11, 0xD4, 0x90, 0x01, 0x8C,
+        0x73, 0x38, 0xBF, 0x86, 0x88, 0x86, 0x17, 0x67,
+        0xFF, 0x8F, 0xF5, 0xB2, 0xBE, 0xBE, 0x27, 0x54,
+        0x8A, 0x14, 0xB2, 0x35, 0xEC, 0xA6, 0x87, 0x4A,
+    ];
+    // g = 0x04 || G.x || G.y (SEC1 uncompressed format, x first)
+    //   G.x = 0x216936D3CD6E53FEC0A4E231FDD6DC5C692CC7609525A7B2C9562D608F25D51A
+    //   G.y = 0x6666666666666666666666666666666666666666666666666666666666666658
+    let g: [u8; 65] = [
+        0x04,
+        0x21, 0x69, 0x36, 0xD3, 0xCD, 0x6E, 0x53, 0xFE,
+        0xC0, 0xA4, 0xE2, 0x31, 0xFD, 0xD6, 0xDC, 0x5C,
+        0x69, 0x2C, 0xC7, 0x60, 0x95, 0x25, 0xA7, 0xB2,
+        0xC9, 0x56, 0x2D, 0x60, 0x8F, 0x25, 0xD5, 0x1A,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x58,
+    ];
+    // n = 0x1000000000000000000000000000000014DEF9DEA2F79CD65812631A5CF5D3ED
+    let n: [u8; 32] = [
+        0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x14, 0xDE, 0xF9, 0xDE, 0xA2, 0xF7, 0x9C, 0xD6,
+        0x58, 0x12, 0x63, 0x1A, 0x5C, 0xF5, 0xD3, 0xED,
+    ];
+
+    // q = public_key (32 bytes, compact EdDSA form without the 0x40
+    // prefix — libgcrypt's _gcry_ecc_eddsa_ensure_compact strips it)
+
+    // Hash: (1:p<len>:<bytes>)(1:a<len>:<bytes>)...(1:q<len>:<bytes>)
+    let mut hasher = Sha1::new();
+    for (name, value) in [
+        ("p", p.as_slice()),
+        ("a", a.as_slice()),
+        ("b", b.as_slice()),
+        ("g", g.as_slice()),
+        ("n", n.as_slice()),
+        ("q", public_key),
+    ] {
+        let header = format!("(1:{}{}", name, value.len());
+        hasher.update(header.as_bytes());
+        hasher.update(b":");
+        hasher.update(value);
+        hasher.update(b")");
+    }
+
+    let hash = hasher.finalize();
+    hash.iter().map(|b| format!("{:02X}", b)).collect()
 }
 
 // ---- Hex utilities ----
@@ -248,138 +311,12 @@ fn send_data(out: &mut impl Write, data: &[u8]) {
     let _ = out.write_all(b"\n");
 }
 
-// ---- Cert import and keygrip extraction ----
-
-/// Extract keygrips from GPG's keyring using --with-keygrip.
-/// Returns keygrips for all keys (primary + subkeys) in order.
-fn extract_keygrips(homedir: &str, log: &dyn Fn(&str)) -> Vec<String> {
-    let output = match Command::new("gpg")
-        .args([
-            "--homedir", homedir, "--no-autostart", "--batch",
-            "--with-colons", "--with-keygrip", "--list-keys",
-        ])
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            log(&format!("gpg --list-keys failed: {}", e));
-            return Vec::new();
-        }
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Parse grp records - order is: primary key, then subkeys
-    // grp:::::::::KEYGRIP:
-    let keygrips: Vec<String> = stdout
-        .lines()
-        .filter(|l| l.starts_with("grp:"))
-        .filter_map(|l| l.split(':').nth(9).map(|s| s.to_string()))
-        .filter(|s| s.len() == 40) // valid keygrips are 40 hex chars
-        .collect();
-
-    keygrips
-}
-
-/// Import the GPG public cert and extract keygrips from GPG.
-///
-/// If the cert is already imported (keygrips exist), skips the import.
-/// This avoids a deadlock when gpg-agent restarts scdaemon: the restarted
-/// scdaemon's `gpg --import` would connect back to the gpg-agent that is
-/// waiting for scdaemon's greeting.
-fn import_cert_and_get_keygrips(
-    cert_armor: &str,
-    log: &dyn Fn(&str),
-) -> Result<Vec<String>, String> {
-    let gnupghome = std::env::var("GNUPGHOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".gnupg")))
-        .map_err(|_| "GNUPGHOME and HOME not set".to_string())?;
-
-    let homedir = gnupghome.to_string_lossy().to_string();
-
-    // Try to extract keygrips first — cert might already be imported
-    // from a previous scdaemon instance. This avoids calling gpg --import
-    // when gpg-agent is waiting for our greeting (which would deadlock).
-    let existing = extract_keygrips(&homedir, log);
-    if existing.len() >= 2 {
-        log(&format!(
-            "cert already imported, {} keygrips: {:?}",
-            existing.len(),
-            existing
-        ));
-        return Ok(existing);
-    }
-
-    // Write cert to file
-    let cert_path = gnupghome.join("keymaster-public.asc");
-    std::fs::write(&cert_path, cert_armor.as_bytes())
-        .map_err(|e| format!("write cert: {}", e))?;
-    log(&format!("cert written to {}", cert_path.display()));
-
-    let cert = cert_path.to_string_lossy().to_string();
-
-    // Import cert (synchronous, no gpg-agent needed for public key import)
-    let import_output = Command::new("gpg")
-        .args(["--homedir", &homedir, "--no-autostart", "--batch", "--import", &cert])
-        .output()
-        .map_err(|e| format!("run gpg --import: {}", e))?;
-    log(&format!(
-        "gpg --import: exit={}, stderr={}",
-        import_output.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&import_output.stderr).trim()
-    ));
-
-    // Set ownertrust to ultimate
-    let fpr_output = Command::new("gpg")
-        .args([
-            "--homedir", &homedir, "--no-autostart", "--batch",
-            "--with-colons", "--list-keys",
-        ])
-        .output()
-        .map_err(|e| format!("run gpg --list-keys: {}", e))?;
-    let fpr_stdout = String::from_utf8_lossy(&fpr_output.stdout);
-    if let Some(fpr_line) = fpr_stdout.lines().find(|l| l.starts_with("fpr:")) {
-        let fpr = fpr_line.split(':').nth(9).unwrap_or("");
-        if !fpr.is_empty() {
-            let trust_input = format!("{}:6:\n", fpr);
-            let mut trust_proc = Command::new("gpg")
-                .args([
-                    "--homedir", &homedir, "--no-autostart", "--batch",
-                    "--import-ownertrust",
-                ])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("run gpg --import-ownertrust: {}", e))?;
-            if let Some(ref mut stdin) = trust_proc.stdin {
-                let _ = stdin.write_all(trust_input.as_bytes());
-            }
-            let _ = trust_proc.wait();
-            log(&format!("ownertrust set for {}", fpr));
-        }
-    }
-
-    // Extract keygrips
-    let keygrips = extract_keygrips(&homedir, log);
-    log(&format!("extracted {} keygrips: {:?}", keygrips.len(), keygrips));
-
-    if keygrips.len() < 2 {
-        return Err(format!(
-            "expected at least 2 keygrips, got {}",
-            keygrips.len()
-        ));
-    }
-
-    Ok(keygrips)
-}
-
 // ---- Scdaemon state ----
 
 struct ScdState {
     identities: Vec<Identity>,
     stored_data: Vec<u8>,
-    client: LocalClient,
+    client: GpgSaClient,
 }
 
 // ---- Command parsing ----
@@ -622,11 +559,11 @@ fn handle_getinfo(out: &mut impl Write, args: &str) {
 
 fn main() {
     let log_path = std::env::var("GNUPGHOME")
-        .map(|h| PathBuf::from(h).join("iz-scdaemon.log"))
-        .unwrap_or_else(|_| PathBuf::from("/tmp/iz-scdaemon.log"));
+        .map(|h| PathBuf::from(h).join("scd-shim.log"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/scd-shim.log"));
 
     let log = move |msg: &str| {
-        eprintln!("iz-scdaemon: {}", msg);
+        eprintln!("scd-shim: {}", msg);
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -636,22 +573,20 @@ fn main() {
         }
     };
 
-    let socket_path = std::env::var("IZ_PKCS11_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET));
-
+    // Find km-gpg-sa proxy socket
+    let socket_path = find_socket_path();
     log(&format!("starting, socket={}", socket_path.display()));
 
-    // Connect to avatar local API
-    let mut client = match LocalClient::connect(&socket_path) {
+    // Connect to km-gpg-sa proxy
+    let mut client = match GpgSaClient::connect(&socket_path) {
         Ok(c) => {
-            log("connected to avatar");
+            log("connected to km-gpg-sa");
             c
         }
         Err(e) => {
             log(&format!("FATAL: connect failed: {}", e));
             let mut stdout = io::stdout().lock();
-            let _ = write!(stdout, "ERR 2 Cannot connect to avatar: {}\n", e);
+            let _ = write!(stdout, "ERR 2 Cannot connect to km-gpg-sa: {}\n", e);
             let _ = stdout.flush();
             std::process::exit(1);
         }
@@ -696,51 +631,28 @@ fn main() {
         })
         .collect();
 
-    // Fetch GPG public cert and import it synchronously.
-    // This runs BEFORE the Assuan greeting; gpg --import --no-autostart only
-    // touches the public keyring and does NOT need gpg-agent.
-    let cert_armor = match client.get_public_cert() {
-        Ok(c) => c,
-        Err(e) => {
-            log(&format!("FATAL: get_public_cert failed: {}", e));
-            let mut stdout = io::stdout().lock();
-            let _ = write!(stdout, "ERR 2 Cannot fetch cert: {}\n", e);
-            let _ = stdout.flush();
-            std::process::exit(1);
-        }
-    };
-
-    let keygrips = match import_cert_and_get_keygrips(&cert_armor, &log) {
-        Ok(grips) => grips,
-        Err(e) => {
-            log(&format!("FATAL: cert import/keygrip extraction failed: {}", e));
-            let mut stdout = io::stdout().lock();
-            let _ = write!(stdout, "ERR 2 Cert import failed: {}\n", e);
-            let _ = stdout.flush();
-            std::process::exit(1);
-        }
-    };
-
-    // Map identities to keyrefs with keygrips from GPG:
-    //   keygrips[0] = primary/cert key → identity 0 → OPENPGP.1
-    //   keygrips[1] = signing subkey   → identity 1 → OPENPGP.3
+    // Compute keygrips internally from public keys using SHA-1 of the
+    // canonical S-expression. This matches libgcrypt's computation and
+    // avoids running `gpg --list-keys` before the greeting (which would
+    // deadlock: gpg-agent is waiting for our greeting, and `gpg` would
+    // try to connect to the already-running gpg-agent).
     let keyrefs = ["OPENPGP.1", "OPENPGP.3"];
     let identities: Vec<Identity> = decoded_identities
         .into_iter()
         .enumerate()
-        .filter_map(|(i, (pk, label, index))| {
-            let keygrip = keygrips.get(i)?.clone();
+        .map(|(i, (pk, label, index))| {
+            let keygrip = compute_keygrip(&pk);
             let keyref = keyrefs.get(i).unwrap_or(&"OPENPGP.1").to_string();
             log(&format!(
                 "identity {}: label={}, keyref={}, keygrip={}",
                 i, label, keyref, keygrip
             ));
-            Some(Identity {
+            Identity {
                 public_key: pk,
                 index,
                 keygrip,
                 keyref,
-            })
+            }
         })
         .collect();
 
@@ -750,9 +662,10 @@ fn main() {
         client,
     };
 
-    // Assuan greeting
+    // Assuan greeting — gpg-agent is waiting for this before it can
+    // process any other requests (including LEARN).
     let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(b"OK iz-scdaemon ready\n");
+    let _ = stdout.write_all(b"OK scd-shim ready\n");
     let _ = stdout.flush();
 
     log("greeting sent, entering command loop");

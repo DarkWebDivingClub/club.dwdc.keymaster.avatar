@@ -3,7 +3,8 @@ resolver = "2"
 members = [
     "crates/avatar",
     "crates/avatar-protocol",
-    "crates/gpg-scdaemon",
+    "crates/km-gpg-sa",
+    "crates/scd-shim",
     "crates/pkcs11-gpg",
     "crates/km-ssh-sa",
 ]

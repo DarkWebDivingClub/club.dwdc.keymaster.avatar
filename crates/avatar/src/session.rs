@@ -1,6 +1,7 @@
 use nostr::prelude::*;
 use nostr::nips::nip44;
 use std::collections::HashMap;
+use tokio::sync::watch;
 use tracing::{info, debug};
 
 /// A service channel within a session.
@@ -9,6 +10,8 @@ pub struct ServiceChannel {
     pub service_type: String,
     pub service_avatar_keys: Keys,
     pub km_service_pubkey: PublicKey,
+    /// KM realm pubkey — used for "realm" marker p tag on service requests.
+    pub km_realm_pubkey: PublicKey,
 }
 
 /// A root session anchored by an attach event
@@ -19,6 +22,8 @@ pub struct RootSession {
     pub identity: String,
     pub alt_ids: Vec<String>,
     pub channels: HashMap<String, ServiceChannel>,
+    /// Shutdown signal sender for service process monitors
+    pub shutdown: Option<watch::Sender<bool>>,
 }
 
 /// Manages active sessions
@@ -40,6 +45,7 @@ impl SessionManager {
         services: Vec<String>,
         identity: String,
         alt_ids: Vec<String>,
+        shutdown: Option<watch::Sender<bool>>,
     ) {
         let session = RootSession {
             attached_session_event_id,
@@ -48,6 +54,7 @@ impl SessionManager {
             identity,
             alt_ids,
             channels: HashMap::new(),
+            shutdown,
         };
         self.sessions.insert(attached_session_event_id, session);
         info!("Root session created: {}", attached_session_event_id);
@@ -59,6 +66,7 @@ impl SessionManager {
         service_type: String,
         service_avatar_keys: Keys,
         km_service_pubkey: PublicKey,
+        km_realm_pubkey: PublicKey,
     ) {
         if let Some(session) = self.sessions.get_mut(&session_id) {
             info!(
@@ -71,6 +79,7 @@ impl SessionManager {
                 service_type: service_type.clone(),
                 service_avatar_keys,
                 km_service_pubkey,
+                km_realm_pubkey,
             };
             session.channels.insert(service_type, channel);
         }
@@ -83,7 +92,15 @@ impl SessionManager {
             .map(|s| s.attached_session_event_id)
     }
 
+    /// Signal shutdown for a session's service monitors and remove the session.
     pub fn remove_session(&mut self, session_id: &EventId) -> Option<RootSession> {
+        // Signal service monitors to stop before removing session
+        if let Some(session) = self.sessions.get(session_id) {
+            if let Some(ref shutdown) = session.shutdown {
+                let _ = shutdown.send(true);
+                info!("Sent shutdown signal to service monitors for session {}", session_id);
+            }
+        }
         let session = self.sessions.remove(session_id);
         if let Some(ref s) = session {
             info!(
@@ -95,13 +112,14 @@ impl SessionManager {
         session
     }
 
-    /// Find any service channel by type — returns the avatar keys and KM service pubkey.
-    pub fn find_service_channel(&self, service_type: &str) -> Option<(Keys, PublicKey)> {
+    /// Find any service channel by type — returns the avatar keys, KM service pubkey, and KM realm pubkey.
+    pub fn find_service_channel(&self, service_type: &str) -> Option<(Keys, PublicKey, PublicKey)> {
         for session in self.sessions.values() {
             if let Some(channel) = session.channels.get(service_type) {
                 return Some((
                     channel.service_avatar_keys.clone(),
                     channel.km_service_pubkey,
+                    channel.km_realm_pubkey,
                 ));
             }
         }
