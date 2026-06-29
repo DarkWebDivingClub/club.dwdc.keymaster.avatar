@@ -7,4 +7,4 @@
 # local_api_socket = "/tmp/keymaster-avatar.sock"
 # seed_file = "~/.config/keymaster-avatar/seed"
 # allowlist = "~/.config/keymaster-avatar/allowlist"
-# service_avatar_dir = "/usr/lib/keymaster-avatar/bin"
+service_avatar_dir = "/usr/lib/keymaster-avatar/bin"

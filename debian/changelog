@@ -1,3 +1,10 @@
+keymaster-avatar (0.2.0-2) unstable; urgency=medium
+
+  * Move daemon to /usr/bin (FHS-conventional placement)
+  * Set service_avatar_dir in default config
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 30 Jun 2026 00:00:00 +0200
+
 keymaster-avatar (0.2.0) unstable; urgency=medium
 
   * Initial Debian packaging
@@ -6,4 +13,4 @@ keymaster-avatar (0.2.0) unstable; urgency=medium
   * scd-shim runtime resolution
   * PKCS#11 library renamed to km_pkcs11_gpg
 
- -- René Malmgren <rene@flowrate.dev>  Sun, 29 Jun 2026 23:00:00 +0200
+ -- Rene Malmgren <duke_h3@dwdc.club>  Sun, 29 Jun 2026 23:00:00 +0200

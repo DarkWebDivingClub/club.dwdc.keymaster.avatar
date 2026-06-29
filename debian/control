@@ -1,7 +1,7 @@
 Source: keymaster-avatar
 Section: utils
 Priority: optional
-Maintainer: René Malmgren <rene@flowrate.dev>
+Maintainer: Rene Malmgren <duke_h3@dwdc.club>
 Build-Depends: debhelper-compat (= 13), cargo, rustc
 Standards-Version: 4.7.0
 Rules-Requires-Root: no
