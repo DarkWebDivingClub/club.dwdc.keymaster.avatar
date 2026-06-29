@@ -1,0 +1,14 @@
+Source: keymaster-avatar
+Section: utils
+Priority: optional
+Maintainer: René Malmgren <rene@flowrate.dev>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: keymaster-avatar
+Architecture: amd64
+Depends: ${misc:Depends}, ${shlibs:Depends}, gnupg, openssh-client
+Description: KeyMaster Avatar daemon and service avatars
+ Nostr-based key service relay with SSH and GPG service avatars
+ for remote cryptographic key operations.

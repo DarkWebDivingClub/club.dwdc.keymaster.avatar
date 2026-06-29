@@ -1,0 +1,10 @@
+# KeyMaster Avatar configuration
+# Uncomment and modify values as needed.
+# CLI flags override these settings.
+
+# relay = "ws://localhost:7000"
+# log_level = "info"
+# local_api_socket = "/tmp/keymaster-avatar.sock"
+# seed_file = "~/.config/keymaster-avatar/seed"
+# allowlist = "~/.config/keymaster-avatar/allowlist"
+# service_avatar_dir = "/usr/lib/keymaster-avatar/bin"

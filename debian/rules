@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --workspace
+
+override_dh_auto_install:
+	install -D -m 755 target/release/keymaster-avatar \
+		debian/keymaster-avatar/usr/lib/keymaster-avatar/bin/keymaster-avatar
+	install -D -m 755 target/release/km-ssh-sa \
+		debian/keymaster-avatar/usr/lib/keymaster-avatar/bin/km-ssh-sa
+	install -D -m 755 target/release/km-gpg-sa \
+		debian/keymaster-avatar/usr/lib/keymaster-avatar/bin/km-gpg-sa
+	install -D -m 755 target/release/scd-shim \
+		debian/keymaster-avatar/usr/lib/keymaster-avatar/bin/scd-shim
+	install -D -m 644 target/release/libkm_pkcs11_gpg.so \
+		debian/keymaster-avatar/usr/lib/keymaster-avatar/lib/libkm_pkcs11_gpg.so
+	install -D -m 644 debian/avatar.toml \
+		debian/keymaster-avatar/etc/keymaster-avatar/avatar.toml
+	mkdir -p debian/keymaster-avatar/usr/bin
+	ln -s /usr/lib/keymaster-avatar/bin/keymaster-avatar \
+		debian/keymaster-avatar/usr/bin/keymaster-avatar
+
+override_dh_auto_test:
+	# skip cargo test during package build
+
+override_dh_shlibdeps:
+	dh_shlibdeps -l debian/keymaster-avatar/usr/lib/keymaster-avatar/lib

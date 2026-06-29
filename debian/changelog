@@ -1,0 +1,9 @@
+keymaster-avatar (0.2.0) unstable; urgency=medium
+
+  * Initial Debian packaging
+  * TOML config file support (/etc/keymaster-avatar/)
+  * Sibling binary resolution for service avatars
+  * scd-shim runtime resolution
+  * PKCS#11 library renamed to km_pkcs11_gpg
+
+ -- René Malmgren <rene@flowrate.dev>  Sun, 29 Jun 2026 23:00:00 +0200
