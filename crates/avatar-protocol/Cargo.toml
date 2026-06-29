@@ -1,6 +1,6 @@
 [package]
 name = "avatar-protocol"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Shared local API types for Avatar ↔ service avatar communication"
 

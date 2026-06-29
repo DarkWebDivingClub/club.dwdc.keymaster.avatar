@@ -148,7 +148,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "avatar-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "keymaster-avatar"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "avatar-protocol",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "km-gpg-sa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "avatar-protocol",
@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "km-ssh-sa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "avatar-protocol",
@@ -1145,7 +1145,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkcs11-gpg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "serde",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "scd-shim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "serde",
