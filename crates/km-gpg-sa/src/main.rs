@@ -1,6 +1,7 @@
 use anyhow::Result;
 use avatar_protocol::{read_line_message, write_line_message, JsonRpcRequest, JsonRpcResponse};
 use clap::Parser;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -22,6 +23,10 @@ fn next_request_id() -> u64 {
     about = "GPG Service Avatar - GPG environment setup and Assuan-to-JSON-RPC proxy"
 )]
 struct Cli {
+    /// Path to TOML config file
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Avatar local API socket path
     #[arg(long, default_value = "/tmp/keymaster-avatar.sock")]
     avatar_socket: PathBuf,
@@ -34,32 +39,112 @@ struct Cli {
     #[arg(long, env = "GNUPGHOME", default_value = "/tmp/gnupg-home")]
     gnupg_home: PathBuf,
 
-    /// Path to scd-shim binary (used in gpg-agent.conf)
-    #[arg(long, default_value = "/usr/local/bin/scd-shim")]
-    scdaemon_program: String,
+    /// Path to scd-shim binary (used in gpg-agent.conf).
+    /// Requires a symlink or absolute path; gpg-agent won't resolve PATH.
+    #[arg(long)]
+    scdaemon_program: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
     log_level: String,
 }
 
+#[derive(Deserialize, Default)]
+struct Config {
+    avatar_socket: Option<PathBuf>,
+    gpg_socket: Option<PathBuf>,
+    gnupg_home: Option<PathBuf>,
+    scdaemon_program: Option<PathBuf>,
+    log_level: Option<String>,
+}
+
+/// Resolve the scd-shim binary path.
+///
+/// Search order:
+/// 1. `--scdaemon-program` CLI flag
+/// 2. `scdaemon_program` from config file
+/// 3. Sibling of the current executable
+/// 4. Fallback: `/usr/local/bin/scd-shim`
+fn resolve_scdaemon_program(cli_value: Option<&str>, config_value: Option<&std::path::Path>) -> PathBuf {
+    // 1. CLI flag
+    if let Some(v) = cli_value {
+        return PathBuf::from(v);
+    }
+
+    // 2. Config
+    if let Some(v) = config_value {
+        return v.to_path_buf();
+    }
+
+    // 3. Sibling
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join("scd-shim");
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+
+    // 4. Legacy fallback
+    PathBuf::from("/usr/local/bin/scd-shim")
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Load config file (CLI > config > default)
+    let config: Config = avatar_protocol::config::load_config(
+        "km-gpg-sa",
+        cli.config.as_deref(),
+    )
+    .unwrap_or_default();
+
+    let log_level = if cli.log_level != "info" {
+        cli.log_level.clone()
+    } else {
+        config.log_level.unwrap_or_else(|| cli.log_level.clone())
+    };
+    let avatar_socket = if cli.avatar_socket != PathBuf::from("/tmp/keymaster-avatar.sock") {
+        cli.avatar_socket.clone()
+    } else {
+        config
+            .avatar_socket
+            .unwrap_or_else(|| cli.avatar_socket.clone())
+    };
+    let gpg_socket = if cli.gpg_socket != PathBuf::from("/tmp/keymaster-avatar-gpg.sock") {
+        cli.gpg_socket.clone()
+    } else {
+        config
+            .gpg_socket
+            .unwrap_or_else(|| cli.gpg_socket.clone())
+    };
+    let gnupg_home = if cli.gnupg_home != PathBuf::from("/tmp/gnupg-home") {
+        cli.gnupg_home.clone()
+    } else {
+        config
+            .gnupg_home
+            .unwrap_or_else(|| cli.gnupg_home.clone())
+    };
+    let scdaemon_program = resolve_scdaemon_program(
+        cli.scdaemon_program.as_deref(),
+        config.scdaemon_program.as_deref(),
+    );
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level)),
         )
         .init();
 
     // Step 1: Connect to avatar local API
     info!(
         "Connecting to avatar local API: {}",
-        cli.avatar_socket.display()
+        avatar_socket.display()
     );
-    let avatar_stream = UnixStream::connect(&cli.avatar_socket).await?;
+    let avatar_stream = UnixStream::connect(&avatar_socket).await?;
     let (reader, mut avatar_writer) = avatar_stream.into_split();
     let mut avatar_reader = BufReader::new(reader);
     info!("Connected to avatar local API");
@@ -98,17 +183,18 @@ async fn main() -> Result<()> {
     info!("Got GPG public cert ({} bytes)", cert_armor.len());
 
     // Step 3: Setup GNUPGHOME
-    setup_gnupg_home(&cli.gnupg_home, &cert_armor, &cli.scdaemon_program, &cli.gpg_socket)?;
-    info!("GNUPGHOME configured at {}", cli.gnupg_home.display());
+    let scdaemon_str = scdaemon_program.to_string_lossy().to_string();
+    setup_gnupg_home(&gnupg_home, &cert_armor, &scdaemon_str, &gpg_socket)?;
+    info!("GNUPGHOME configured at {}", gnupg_home.display());
 
     // Step 4: Start proxy listener BEFORE LEARN (scd-shim connects back during LEARN)
     let avatar_writer = Arc::new(Mutex::new(avatar_writer));
     let avatar_reader = Arc::new(Mutex::new(avatar_reader));
 
     // Remove stale socket if it exists
-    let _ = std::fs::remove_file(&cli.gpg_socket);
-    let listener = UnixListener::bind(&cli.gpg_socket)?;
-    info!("GPG proxy listening on: {}", cli.gpg_socket.display());
+    let _ = std::fs::remove_file(&gpg_socket);
+    let listener = UnixListener::bind(&gpg_socket)?;
+    info!("GPG proxy listening on: {}", gpg_socket.display());
 
     let proxy_writer = avatar_writer.clone();
     let proxy_reader = avatar_reader.clone();
@@ -120,7 +206,7 @@ async fn main() -> Result<()> {
     info!("Killing stale gpg-agent...");
     let kill_status = tokio::process::Command::new("gpgconf")
         .arg("--homedir")
-        .arg(&cli.gnupg_home)
+        .arg(&gnupg_home)
         .arg("--kill")
         .arg("gpg-agent")
         .status()
@@ -131,7 +217,7 @@ async fn main() -> Result<()> {
     info!("Running SCD LEARN...");
     let learn_output = tokio::process::Command::new("gpg-connect-agent")
         .arg("--homedir")
-        .arg(&cli.gnupg_home)
+        .arg(&gnupg_home)
         .arg("LEARN --sendinfo --force")
         .arg("/bye")
         .output()
@@ -149,10 +235,10 @@ async fn main() -> Result<()> {
 
     // Step 7: Import cert
     info!("Importing GPG public cert...");
-    let cert_path = cli.gnupg_home.join("keymaster-public.asc");
+    let cert_path = gnupg_home.join("keymaster-public.asc");
     let import_output = tokio::process::Command::new("gpg")
         .arg("--homedir")
-        .arg(&cli.gnupg_home)
+        .arg(&gnupg_home)
         .arg("--batch")
         .arg("--import")
         .arg(&cert_path)
@@ -173,8 +259,8 @@ async fn main() -> Result<()> {
             "gpg --homedir {} --batch --with-colons --list-keys 2>/dev/null \
              | awk -F: '/^fpr:/{{print $10 \":6:\"}}' \
              | gpg --homedir {} --batch --import-ownertrust",
-            cli.gnupg_home.display(),
-            cli.gnupg_home.display()
+            gnupg_home.display(),
+            gnupg_home.display()
         ))
         .output()
         .await?;
@@ -185,8 +271,75 @@ async fn main() -> Result<()> {
         info!("Ownertrust set to ultimate");
     }
 
+    // Step 8.5: Create shadow key stubs in private-keys-v1.d/
+    info!("Creating shadow key stubs...");
+    let privkeys_dir = gnupg_home.join("private-keys-v1.d");
+    std::fs::create_dir_all(&privkeys_dir)?;
+
+    let list_output = tokio::process::Command::new("gpg")
+        .arg("--homedir")
+        .arg(&gnupg_home)
+        .arg("--batch")
+        .arg("--with-colons")
+        .arg("--with-keygrip")
+        .arg("--list-keys")
+        .output()
+        .await?;
+
+    if list_output.status.success() {
+        let stdout = String::from_utf8_lossy(&list_output.stdout);
+        for line in stdout.lines() {
+            if line.starts_with("grp:") {
+                let fields: Vec<&str> = line.split(':').collect();
+                if fields.len() > 9 {
+                    let keygrip = fields[9];
+                    if keygrip.len() == 40 {
+                        let stub_path = privkeys_dir.join(format!("{}.key", keygrip));
+                        if !stub_path.exists() {
+                            std::fs::write(&stub_path, "(shadowed-private-key)\n")?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                std::fs::set_permissions(
+                                    &stub_path,
+                                    std::fs::Permissions::from_mode(0o600),
+                                )?;
+                            }
+                            info!("Created stub: {}.key", keygrip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Restart gpg-agent to pick up stubs, then re-learn card keys
+    let _ = tokio::process::Command::new("gpgconf")
+        .arg("--homedir")
+        .arg(&gnupg_home)
+        .arg("--kill")
+        .arg("gpg-agent")
+        .status()
+        .await;
+
+    let learn2 = tokio::process::Command::new("gpg-connect-agent")
+        .arg("--homedir")
+        .arg(&gnupg_home)
+        .arg("LEARN --sendinfo --force")
+        .arg("/bye")
+        .output()
+        .await?;
+    if learn2.status.success() {
+        info!("Re-learned card keys after stub creation");
+    } else {
+        warn!(
+            "Re-learn failed: {}",
+            String::from_utf8_lossy(&learn2.stderr)
+        );
+    }
+
     // Step 9: Ready
-    info!("GPG ready — proxy active on {}", cli.gpg_socket.display());
+    info!("GPG ready — proxy active on {}", gpg_socket.display());
 
     // Step 10: Wait for proxy to end (killed by avatar kill_on_drop)
     let _ = proxy_handle.await;
@@ -195,12 +348,12 @@ async fn main() -> Result<()> {
     info!("Shutting down, killing gpg-agent...");
     let _ = tokio::process::Command::new("gpgconf")
         .arg("--homedir")
-        .arg(&cli.gnupg_home)
+        .arg(&gnupg_home)
         .arg("--kill")
         .arg("gpg-agent")
         .status()
         .await;
-    let _ = std::fs::remove_file(&cli.gpg_socket);
+    let _ = std::fs::remove_file(&gpg_socket);
 
     Ok(())
 }

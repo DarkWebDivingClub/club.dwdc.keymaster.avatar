@@ -12,6 +12,7 @@ use bitcoin::secp256k1::{Secp256k1, schnorr::Signature as SchnorrSignature};
 use clap::Parser;
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -29,6 +30,10 @@ use crate::session::SessionManager;
     about = "KeyMaster Avatar - Nostr-based key service relay agent"
 )]
 struct Cli {
+    /// Path to TOML config file
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// Nostr relay URL to connect to
     #[arg(long, default_value = "ws://localhost:7000")]
     relay: String,
@@ -48,6 +53,16 @@ struct Cli {
     /// Path to identity allowlist file (one hex npub per line)
     #[arg(long, default_value = "~/.config/keymaster-avatar/allowlist")]
     allowlist: String,
+}
+
+#[derive(Deserialize, Default)]
+struct Config {
+    relay: Option<String>,
+    log_level: Option<String>,
+    local_api_socket: Option<PathBuf>,
+    seed_file: Option<String>,
+    allowlist: Option<String>,
+    service_avatar_dir: Option<PathBuf>,
 }
 
 /// Pending response futures for service channel requests sent to KM.
@@ -90,15 +105,51 @@ fn load_allowlist(path: &std::path::Path) -> HashSet<String> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Load config file (CLI > config > default)
+    let config: Config = avatar_protocol::config::load_config(
+        "avatar",
+        cli.config.as_deref(),
+    )
+    .unwrap_or_default();
+
+    let relay = if cli.relay != "ws://localhost:7000" {
+        cli.relay.clone()
+    } else {
+        config.relay.unwrap_or_else(|| cli.relay.clone())
+    };
+    let log_level = if cli.log_level != "info" {
+        cli.log_level.clone()
+    } else {
+        config.log_level.unwrap_or_else(|| cli.log_level.clone())
+    };
+    let local_api_socket = if cli.local_api_socket != PathBuf::from("/tmp/keymaster-avatar.sock") {
+        cli.local_api_socket.clone()
+    } else {
+        config
+            .local_api_socket
+            .unwrap_or_else(|| cli.local_api_socket.clone())
+    };
+    let seed_file = if cli.seed_file != "~/.config/keymaster-avatar/seed" {
+        cli.seed_file.clone()
+    } else {
+        config.seed_file.unwrap_or_else(|| cli.seed_file.clone())
+    };
+    let allowlist_str = if cli.allowlist != "~/.config/keymaster-avatar/allowlist" {
+        cli.allowlist.clone()
+    } else {
+        config.allowlist.unwrap_or_else(|| cli.allowlist.clone())
+    };
+    let service_avatar_dir = config.service_avatar_dir;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cli.log_level)),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&log_level)),
         )
         .init();
 
     // Load identity allowlist
-    let allowlist_path = expand_tilde(&cli.allowlist);
+    let allowlist_path = expand_tilde(&allowlist_str);
     let allowlist = load_allowlist(&allowlist_path);
     if allowlist.is_empty() {
         info!("No identity allowlist (all identities accepted)");
@@ -108,7 +159,7 @@ async fn main() -> Result<()> {
     let allowlist = Arc::new(allowlist);
 
     // Load or create persistent seed
-    let seed_path = expand_tilde(&cli.seed_file);
+    let seed_path = expand_tilde(&seed_file);
     let seed = seed::load_or_create_seed(&seed_path)?;
     info!("Seed loaded from: {}", seed_path.display());
 
@@ -122,14 +173,14 @@ async fn main() -> Result<()> {
 
     // Display QR bootstrap payload
     let qr_payload = serde_json::json!({
-        "relay": &cli.relay,
+        "relay": &relay,
         "login_xpub": login_xpub.to_string(),
-        "services": ["ssh"]
+        "services": ["ssh", "gpg"]
     });
     let qr_json = serde_json::to_string(&qr_payload)?;
     display_qr(&qr_json);
     println!("\nQR Payload: {}", qr_json);
-    println!("Relay: {}", cli.relay);
+    println!("Relay: {}", relay);
     println!("Avatar pubkey: {}", avatar_pubkey.to_hex());
     println!("Login xpub: {}", login_xpub);
     println!("\nWaiting for KeyMaster attach...\n");
@@ -140,9 +191,9 @@ async fn main() -> Result<()> {
 
     // Connect to relay
     let client = Client::new(avatar_keys.clone());
-    client.add_relay(&cli.relay).await?;
+    client.add_relay(&relay).await?;
     client.connect().await;
-    info!("Connected to relay: {}", cli.relay);
+    info!("Connected to relay: {}", relay);
 
     // Subscribe to events addressed to us via explicit #p filter.
     // With "login" marker p tags on all KM→Avatar service responses,
@@ -159,19 +210,20 @@ async fn main() -> Result<()> {
     let avatar_keys_arc = Arc::new(avatar_keys.clone());
     let client_arc = Arc::new(client.clone());
     local_api::start_listener(
-        &cli.local_api_socket,
+        &local_api_socket,
         avatar_keys_arc,
         client_arc,
         session_mgr.clone(),
         pending_responses.clone(),
     )
     .await?;
-    println!("LOCAL_API_SOCK={}", cli.local_api_socket.display());
+    println!("LOCAL_API_SOCK={}", local_api_socket.display());
 
     // Store login keys in Arcs for use in the event loop
     let login_xpriv = Arc::new(login_keys.xpriv);
     let login_xpub_arc = Arc::new(login_xpub);
-    let local_api_socket = Arc::new(cli.local_api_socket.clone());
+    let service_avatar_dir = Arc::new(service_avatar_dir);
+    let local_api_socket = Arc::new(local_api_socket);
 
     // Event loop
     let event_pending = pending_responses.clone();
@@ -185,6 +237,7 @@ async fn main() -> Result<()> {
             let login_xpub = login_xpub_arc.clone();
             let allowlist = allowlist.clone();
             let local_api_socket = local_api_socket.clone();
+            let service_avatar_dir = service_avatar_dir.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
@@ -198,6 +251,7 @@ async fn main() -> Result<()> {
                             &login_xpub,
                             &allowlist,
                             &local_api_socket,
+                            service_avatar_dir.as_deref(),
                             &event,
                         )
                         .await
@@ -223,6 +277,7 @@ async fn handle_event(
     login_xpub: &Xpub,
     allowlist: &HashSet<String>,
     local_api_socket: &std::path::Path,
+    service_avatar_dir: Option<&std::path::Path>,
     event: &Event,
 ) -> Result<()> {
     let sender_pubkey = event.pubkey;
@@ -284,6 +339,7 @@ async fn handle_event(
                     login_xpub,
                     allowlist,
                     local_api_socket,
+                    service_avatar_dir,
                     event,
                     &sender_pubkey,
                     &msg,
@@ -348,6 +404,7 @@ async fn handle_attach(
     login_xpub: &Xpub,
     allowlist: &HashSet<String>,
     local_api_socket: &std::path::Path,
+    service_avatar_dir: Option<&std::path::Path>,
     event: &Event,
     km_pubkey: &PublicKey,
     msg: &JsonRpcMessage,
@@ -580,7 +637,8 @@ async fn handle_attach(
         let svc = service_type.clone();
         let socket = local_api_socket.to_path_buf();
         let rx = shutdown_rx.clone();
-        tokio::spawn(service_monitor(svc, socket, rx));
+        let sa_dir = service_avatar_dir.map(|p| p.to_path_buf());
+        tokio::spawn(service_monitor(svc, socket, sa_dir, rx));
     }
 
     // Build accepted list
@@ -672,14 +730,45 @@ async fn send_response(
     Ok(())
 }
 
+/// Resolve the path to a service avatar binary.
+///
+/// Search order:
+/// 1. `service_avatar_dir` from config — look for the binary there
+/// 2. Sibling of the current executable
+/// 3. Fall back to bare name (resolved via PATH)
+fn resolve_service_binary(service_type: &str, service_avatar_dir: Option<&std::path::Path>) -> PathBuf {
+    let name = format!("km-{}-sa", service_type);
+
+    // 1. Config override
+    if let Some(dir) = service_avatar_dir {
+        let path = dir.join(&name);
+        if path.exists() {
+            return path;
+        }
+    }
+
+    // 2. Sibling lookup
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let path = dir.join(&name);
+            if path.exists() {
+                return path;
+            }
+        }
+    }
+
+    // 3. PATH fallback
+    PathBuf::from(name)
+}
+
 /// Spawn a service avatar process (e.g. km-ssh-sa).
-/// Binary name: km-{service_type}-sa, found via PATH.
 async fn spawn_service_avatar(
     service_type: &str,
     avatar_socket: &std::path::Path,
+    service_avatar_dir: Option<&std::path::Path>,
 ) -> Result<tokio::process::Child> {
-    let binary = format!("km-{}-sa", service_type);
-    info!("Spawning service process: {} (socket: {})", binary, avatar_socket.display());
+    let binary = resolve_service_binary(service_type, service_avatar_dir);
+    info!("Spawning service process: {} (socket: {})", binary.display(), avatar_socket.display());
     let mut cmd = tokio::process::Command::new(&binary);
     cmd.arg("--avatar-socket")
         .arg(avatar_socket)
@@ -692,7 +781,7 @@ async fn spawn_service_avatar(
     }
     let child = cmd
         .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", binary, e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", binary.display(), e))?;
     Ok(child)
 }
 
@@ -700,10 +789,11 @@ async fn spawn_service_avatar(
 async fn service_monitor(
     service_type: String,
     avatar_socket: PathBuf,
+    service_avatar_dir: Option<PathBuf>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let mut child = match spawn_service_avatar(&service_type, &avatar_socket).await {
+        let mut child = match spawn_service_avatar(&service_type, &avatar_socket, service_avatar_dir.as_deref()).await {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to spawn {}: {}", service_type, e);

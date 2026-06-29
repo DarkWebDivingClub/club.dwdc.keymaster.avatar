@@ -188,7 +188,7 @@ pub unsafe extern "C" fn c_initialize(_init_args: CK_VOID_PTR) -> CK_RV {
         return CKR_CRYPTOKI_ALREADY_INITIALIZED;
     }
 
-    let socket_path = std::env::var("IZ_PKCS11_SOCKET")
+    let socket_path = std::env::var("KM_PKCS11_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET));
 
@@ -236,7 +236,7 @@ pub unsafe extern "C" fn c_initialize(_init_args: CK_VOID_PTR) -> CK_RV {
         .filter_map(|(i, id)| {
             if id.key_type != "ed25519" {
                 eprintln!(
-                    "iz_pkcs11_gpg: skipping unsupported key type: {}",
+                    "km_pkcs11_gpg: skipping unsupported key type: {}",
                     id.key_type
                 );
                 return None;
@@ -244,13 +244,13 @@ pub unsafe extern "C" fn c_initialize(_init_args: CK_VOID_PTR) -> CK_RV {
             let public_key = match BASE64.decode(&id.public_key) {
                 Ok(pk) => pk,
                 Err(e) => {
-                    eprintln!("iz_pkcs11_gpg: decode public_key failed: {}", e);
+                    eprintln!("km_pkcs11_gpg: decode public_key failed: {}", e);
                     return None;
                 }
             };
             if public_key.len() != 32 {
                 eprintln!(
-                    "iz_pkcs11_gpg: unexpected public key length: {}",
+                    "km_pkcs11_gpg: unexpected public key length: {}",
                     public_key.len()
                 );
                 return None;
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn c_initialize(_init_args: CK_VOID_PTR) -> CK_RV {
     import_gpg_cert(&mut client);
 
     eprintln!(
-        "iz_pkcs11_gpg: initialized with {} identit{} from {}",
+        "km_pkcs11_gpg: initialized with {} identit{} from {}",
         identities.len(),
         if identities.len() == 1 { "y" } else { "ies" },
         socket_path.display()
@@ -305,7 +305,7 @@ fn import_gpg_cert(client: &mut LocalClient) {
     let cert_armor = match client.get_public_cert() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("iz_pkcs11_gpg: get_public_cert failed (non-fatal): {}", e);
+            eprintln!("km_pkcs11_gpg: get_public_cert failed (non-fatal): {}", e);
             return;
         }
     };
@@ -315,7 +315,7 @@ fn import_gpg_cert(client: &mut LocalClient) {
         Err(_) => match std::env::var("HOME") {
             Ok(home) => PathBuf::from(home).join(".gnupg"),
             Err(_) => {
-                eprintln!("iz_pkcs11_gpg: GNUPGHOME and HOME not set, skipping cert import");
+                eprintln!("km_pkcs11_gpg: GNUPGHOME and HOME not set, skipping cert import");
                 return;
             }
         },
@@ -326,11 +326,11 @@ fn import_gpg_cert(client: &mut LocalClient) {
     if let Err(e) = std::fs::File::create(&cert_path)
         .and_then(|mut f| f.write_all(cert_armor.as_bytes()))
     {
-        eprintln!("iz_pkcs11_gpg: write cert failed (non-fatal): {}", e);
+        eprintln!("km_pkcs11_gpg: write cert failed (non-fatal): {}", e);
         return;
     }
 
-    eprintln!("iz_pkcs11_gpg: cert written to {}", cert_path.display());
+    eprintln!("km_pkcs11_gpg: cert written to {}", cert_path.display());
 
     // Spawn a detached shell process to import after a delay.
     // The process survives parent (scdaemon) death via reparenting to init.
@@ -356,8 +356,8 @@ fn import_gpg_cert(client: &mut LocalClient) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        Ok(_) => eprintln!("iz_pkcs11_gpg: deferred cert import scheduled"),
-        Err(e) => eprintln!("iz_pkcs11_gpg: failed to spawn import process (non-fatal): {}", e),
+        Ok(_) => eprintln!("km_pkcs11_gpg: deferred cert import scheduled"),
+        Err(e) => eprintln!("km_pkcs11_gpg: failed to spawn import process (non-fatal): {}", e),
     }
 }
 
@@ -1003,7 +1003,7 @@ pub unsafe extern "C" fn c_sign(
     let mut client = match LocalClient::connect(&socket_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("iz_pkcs11_gpg: sign connect failed: {}", e);
+            eprintln!("km_pkcs11_gpg: sign connect failed: {}", e);
             return CKR_DEVICE_ERROR;
         }
     };
@@ -1011,14 +1011,14 @@ pub unsafe extern "C" fn c_sign(
     let raw_sig = match client.sign(identity_index, &public_key, data_slice) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("iz_pkcs11_gpg: sign failed: {}", e);
+            eprintln!("km_pkcs11_gpg: sign failed: {}", e);
             return CKR_DEVICE_ERROR;
         }
     };
 
     if raw_sig.len() != ED25519_SIG_LEN as usize {
         eprintln!(
-            "iz_pkcs11_gpg: unexpected signature length: {} (expected {})",
+            "km_pkcs11_gpg: unexpected signature length: {} (expected {})",
             raw_sig.len(),
             ED25519_SIG_LEN
         );

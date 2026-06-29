@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
-name = "iz_pkcs11_gpg"
+name = "km_pkcs11_gpg"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

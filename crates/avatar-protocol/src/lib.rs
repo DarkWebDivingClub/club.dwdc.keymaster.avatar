@@ -1,3 +1,5 @@
+pub mod config;
+
 use anyhow::{bail, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
