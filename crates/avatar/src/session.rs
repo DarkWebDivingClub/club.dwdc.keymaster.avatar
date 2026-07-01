@@ -22,8 +22,10 @@ pub struct RootSession {
     pub identity: String,
     pub alt_ids: Vec<String>,
     pub channels: HashMap<String, ServiceChannel>,
-    /// Shutdown signal sender for service process monitors
+    /// Shutdown signal sender for session cleanup
     pub shutdown: Option<watch::Sender<bool>>,
+    /// Shutdown sender for the per-user API socket listener
+    pub api_socket_shutdown: Option<watch::Sender<bool>>,
 }
 
 /// Manages active sessions
@@ -55,9 +57,21 @@ impl SessionManager {
             alt_ids,
             channels: HashMap::new(),
             shutdown,
+            api_socket_shutdown: None,
         };
         self.sessions.insert(attached_session_event_id, session);
         info!("Root session created: {}", attached_session_event_id);
+    }
+
+    /// Set the per-user API socket shutdown handle for a session.
+    pub fn set_api_socket_shutdown(
+        &mut self,
+        session_id: &EventId,
+        shutdown: watch::Sender<bool>,
+    ) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.api_socket_shutdown = Some(shutdown);
+        }
     }
 
     pub fn add_service_channel(
@@ -92,13 +106,15 @@ impl SessionManager {
             .map(|s| s.attached_session_event_id)
     }
 
-    /// Signal shutdown for a session's service monitors and remove the session.
+    /// Signal shutdown for a session and remove it.
     pub fn remove_session(&mut self, session_id: &EventId) -> Option<RootSession> {
-        // Signal service monitors to stop before removing session
         if let Some(session) = self.sessions.get(session_id) {
             if let Some(ref shutdown) = session.shutdown {
                 let _ = shutdown.send(true);
-                info!("Sent shutdown signal to service monitors for session {}", session_id);
+            }
+            if let Some(ref shutdown) = session.api_socket_shutdown {
+                let _ = shutdown.send(true);
+                info!("Sent shutdown signal to per-user API listener for session {}", session_id);
             }
         }
         let session = self.sessions.remove(session_id);

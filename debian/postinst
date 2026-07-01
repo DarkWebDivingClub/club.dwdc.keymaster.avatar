@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create km-avatar system user if it doesn't exist
+        if ! getent passwd km-avatar >/dev/null 2>&1; then
+            adduser --system --no-create-home --group km-avatar
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

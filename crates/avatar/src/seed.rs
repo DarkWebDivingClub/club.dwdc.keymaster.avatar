@@ -5,6 +5,9 @@ use bitcoin::secp256k1::Secp256k1;
 use bitcoin::Network;
 use nostr::prelude::*;
 use std::path::Path;
+use tracing::info;
+
+pub const DEFAULT_SEED_PATH: &str = "/var/lib/keymaster-avatar/seed";
 
 /// Login keys derived from the master seed at m/0.
 pub struct LoginKeys {
@@ -13,42 +16,70 @@ pub struct LoginKeys {
     pub nostr_keys: Keys,
 }
 
-/// Load a 32-byte seed from `path`, or create one if it doesn't exist.
-pub fn load_or_create_seed(path: &Path) -> Result<[u8; 32]> {
-    if path.exists() {
-        let data = std::fs::read(path).context("reading seed file")?;
-        if data.len() != 32 {
-            anyhow::bail!(
-                "seed file {} has {} bytes, expected 32",
-                path.display(),
-                data.len()
-            );
-        }
-        let mut seed = [0u8; 32];
-        seed.copy_from_slice(&data);
-        Ok(seed)
-    } else {
-        let mut seed = [0u8; 32];
-        getrandom::getrandom(&mut seed).context("generating random seed")?;
-
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("creating seed directory")?;
-        }
-
-        std::fs::write(path, &seed).context("writing seed file")?;
-
-        // Set permissions to 0o600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-                .context("setting seed file permissions")?;
-        }
-
-        Ok(seed)
+/// Load the avatar seed from `seed_path`.
+///
+/// If the file exists, read and return it. If it does not exist,
+/// generate a random 32-byte seed and try to write it. Fails with
+/// a clear error if the parent directory does not exist or is not
+/// writable.
+pub fn resolve_seed(seed_path: &Path) -> Result<[u8; 32]> {
+    if seed_path.exists() {
+        let seed = read_seed(seed_path)?;
+        info!("Seed loaded from {}", seed_path.display());
+        return Ok(seed);
     }
+
+    // Verify parent directory exists and is writable before generating
+    let parent = seed_path.parent()
+        .ok_or_else(|| anyhow::anyhow!("seed path has no parent directory: {}", seed_path.display()))?;
+
+    if !parent.exists() {
+        anyhow::bail!(
+            "seed directory does not exist: {} — create it or check seed_file config",
+            parent.display()
+        );
+    }
+
+    // Check writability by attempting to create a temp file
+    let probe = parent.join(".seed-probe");
+    std::fs::write(&probe, b"")
+        .with_context(|| format!(
+            "seed directory is not writable: {} — check ownership/permissions",
+            parent.display()
+        ))?;
+    let _ = std::fs::remove_file(&probe);
+
+    // Generate and persist
+    let mut seed = [0u8; 32];
+    getrandom::getrandom(&mut seed).context("generating random seed")?;
+
+    std::fs::write(seed_path, &seed)
+        .with_context(|| format!("writing seed file: {}", seed_path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(seed_path, std::fs::Permissions::from_mode(0o600))
+            .context("setting seed file permissions")?;
+    }
+
+    info!("Generated new seed at {}", seed_path.display());
+    Ok(seed)
+}
+
+fn read_seed(path: &Path) -> Result<[u8; 32]> {
+    let data = std::fs::read(path)
+        .with_context(|| format!("reading seed file: {}", path.display()))?;
+    if data.len() != 32 {
+        anyhow::bail!(
+            "seed file {} has {} bytes, expected 32",
+            path.display(),
+            data.len()
+        );
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&data);
+    Ok(seed)
 }
 
 /// Derive login keys at m/`login_seq` from the master seed.
@@ -202,21 +233,36 @@ mod tests {
     }
 
     #[test]
-    fn t_load_or_create_seed_roundtrip() {
+    fn t_read_configured_seed() {
         let dir = std::env::temp_dir().join("keymaster-avatar-test-seed");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("seed");
 
-        // First call creates
-        let seed1 = load_or_create_seed(&path).unwrap();
-        assert!(path.exists());
+        std::fs::write(&path, &TEST_SEED).unwrap();
+        let loaded = read_seed(&path).unwrap();
+        assert_eq!(loaded, TEST_SEED);
 
-        // Second call loads the same seed
-        let seed2 = load_or_create_seed(&path).unwrap();
-        assert_eq!(seed1, seed2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // Cleanup
+    #[test]
+    fn t_read_seed_missing_is_error() {
+        let path = std::env::temp_dir().join("keymaster-avatar-test-seed-missing");
+        let _ = std::fs::remove_file(&path);
+        assert!(read_seed(&path).is_err());
+    }
+
+    #[test]
+    fn t_read_seed_rejects_wrong_size() {
+        let dir = std::env::temp_dir().join("keymaster-avatar-test-seed-bad");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seed");
+
+        std::fs::write(&path, b"too short").unwrap();
+        assert!(read_seed(&path).is_err());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

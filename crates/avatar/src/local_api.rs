@@ -7,50 +7,93 @@ use avatar_protocol::{
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{oneshot, watch, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::protocol::PROTOCOL_KIND;
 use crate::session::SessionManager;
 use crate::PendingResponses;
 
-/// Start the local API Unix socket listener.
-/// Accepts connections from service avatar processes and forwards their
-/// requests to the appropriate Nostr service channel.
-pub async fn start_listener(
-    socket_path: &Path,
+/// Start a per-user API socket listener at `<socket_dir>/api-<uid>.sock`.
+///
+/// The socket is chowned to the target user and chmoded to 0700 so only
+/// that user's service avatars can connect.
+///
+/// Returns the socket path and a shutdown sender. Drop or send on the
+/// sender to stop the listener and remove the socket.
+pub async fn start_user_listener(
+    socket_dir: &Path,
+    uid: u32,
+    gid: u32,
     avatar_keys: Arc<Keys>,
     client: Arc<Client>,
     session_mgr: Arc<RwLock<SessionManager>>,
     pending: PendingResponses,
-) -> Result<()> {
-    let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
-    info!("Local API listening on: {}", socket_path.display());
+) -> Result<(PathBuf, watch::Sender<bool>)> {
+    let socket_path = socket_dir.join(format!("api-{}.sock", uid));
+
+    // Remove stale socket
+    let _ = std::fs::remove_file(&socket_path);
+
+    let listener = UnixListener::bind(&socket_path)?;
+
+    // chmod before chown — we still own the file at this point
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    // chown to target user (requires CAP_CHOWN)
+    nix::unistd::chown(
+        &socket_path,
+        Some(nix::unistd::Uid::from_raw(uid)),
+        Some(nix::unistd::Gid::from_raw(gid)),
+    )?;
+
+    info!(
+        "Per-user API listening on: {} (uid={}, gid={})",
+        socket_path.display(),
+        uid,
+        gid
+    );
+
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let path_for_cleanup = socket_path.clone();
 
     tokio::spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    debug!("Local API: new connection");
-                    let keys = avatar_keys.clone();
-                    let cli = client.clone();
-                    let mgr = session_mgr.clone();
-                    let pend = pending.clone();
-                    tokio::spawn(handle_connection(stream, keys, cli, mgr, pend));
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, _)) => {
+                            debug!("Local API (uid={}): new connection", uid);
+                            let keys = avatar_keys.clone();
+                            let cli = client.clone();
+                            let mgr = session_mgr.clone();
+                            let pend = pending.clone();
+                            tokio::spawn(handle_connection(stream, keys, cli, mgr, pend));
+                        }
+                        Err(e) => {
+                            error!("Local API (uid={}) accept error: {}", uid, e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Local API accept error: {}", e);
+                _ = shutdown_rx.changed() => {
+                    info!("Per-user API listener shutting down (uid={})", uid);
+                    break;
                 }
             }
         }
+        // Cleanup socket file
+        let _ = std::fs::remove_file(&path_for_cleanup);
     });
 
-    Ok(())
+    Ok((socket_path, shutdown_tx))
 }
 
 async fn handle_connection(

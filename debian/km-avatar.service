@@ -1,0 +1,17 @@
+[Unit]
+Description=KeyMaster Avatar daemon
+After=network-online.target strfry.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=km-avatar
+AmbientCapabilities=CAP_CHOWN
+ExecStart=/usr/bin/keymaster-avatar --config /etc/keymaster-avatar/avatar.toml
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=keymaster-avatar
+StateDirectory=keymaster-avatar
+
+[Install]
+WantedBy=multi-user.target

@@ -19,6 +19,14 @@ override_dh_auto_install:
 		debian/keymaster-avatar/usr/lib/keymaster-avatar/lib/libkm_pkcs11_gpg.so
 	install -D -m 644 debian/avatar.toml \
 		debian/keymaster-avatar/etc/keymaster-avatar/avatar.toml
+	install -D -m 644 debian/users.toml \
+		debian/keymaster-avatar/etc/keymaster-avatar/users.toml
+	install -D -m 644 debian/km-avatar.service \
+		debian/keymaster-avatar/lib/systemd/system/km-avatar.service
+	install -D -m 644 debian/km-ssh-sa.service \
+		debian/keymaster-avatar/usr/lib/systemd/user/km-ssh-sa.service
+	install -D -m 644 debian/km-gpg-sa.service \
+		debian/keymaster-avatar/usr/lib/systemd/user/km-gpg-sa.service
 override_dh_auto_test:
 	# skip cargo test during package build
 

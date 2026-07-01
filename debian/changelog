@@ -1,3 +1,17 @@
+keymaster-avatar (0.2.0-3) unstable; urgency=medium
+
+  * Systemd deployment (Mission 20)
+  * Add km-avatar.service (system unit, User=km-avatar, CAP_CHOWN)
+  * Add km-ssh-sa.service and km-gpg-sa.service (user units)
+  * Add per-user API sockets (/run/keymaster-avatar/api-UID.sock)
+  * Add user mapping module (users.toml: npub → unix user)
+  * Add descriptor export (--descriptor-path)
+  * Remove service avatar spawning (now systemd user services)
+  * Add reconnection logic to km-ssh-sa and km-gpg-sa
+  * Create km-avatar system user via postinst
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 30 Jun 2026 16:00:00 +0200
+
 keymaster-avatar (0.2.0-2) unstable; urgency=medium
 
   * Move daemon to /usr/bin (FHS-conventional placement)
