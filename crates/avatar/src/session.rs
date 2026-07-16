@@ -146,3 +146,139 @@ impl SessionManager {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr::prelude::*;
+    use tokio::sync::watch;
+
+    /// Helper: generate a random EventId for testing.
+    fn random_event_id() -> EventId {
+        let keys = Keys::generate();
+        let event = EventBuilder::text_note("test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        event.id
+    }
+
+    #[test]
+    fn test_evict_stale_session_on_duplicate_km_pubkey() {
+        let mut mgr = SessionManager::new();
+        let km_keys = Keys::generate();
+        let km_pubkey = km_keys.public_key();
+
+        let sid1 = random_event_id();
+        let sid2 = random_event_id();
+
+        // Create first session
+        mgr.create_root_session(
+            sid1,
+            km_pubkey,
+            vec!["ssh".to_string()],
+            "alice".to_string(),
+            vec![],
+            None,
+        );
+        assert!(mgr.find_session_by_km_pubkey(&km_pubkey).is_some());
+
+        // Evict stale session and create second
+        if let Some(old_sid) = mgr.find_session_by_km_pubkey(&km_pubkey) {
+            mgr.remove_session(&old_sid);
+        }
+        mgr.create_root_session(
+            sid2,
+            km_pubkey,
+            vec!["ssh".to_string()],
+            "alice".to_string(),
+            vec![],
+            None,
+        );
+
+        // Only the second session should remain
+        let found = mgr.find_session_by_km_pubkey(&km_pubkey);
+        assert_eq!(found, Some(sid2));
+        assert!(mgr.find_service_channel("ssh").is_none()); // no channels added yet
+    }
+
+    #[test]
+    fn test_find_service_channel_returns_latest() {
+        let mut mgr = SessionManager::new();
+
+        let keys_a = Keys::generate();
+        let keys_b = Keys::generate();
+        let svc_keys = Keys::generate();
+        let km_svc_pk = Keys::generate().public_key();
+
+        let sid_a = random_event_id();
+        let sid_b = random_event_id();
+
+        // Session A with ssh channel
+        mgr.create_root_session(
+            sid_a,
+            keys_a.public_key(),
+            vec!["ssh".to_string()],
+            "alice".to_string(),
+            vec![],
+            None,
+        );
+        mgr.add_service_channel(
+            sid_a,
+            "ssh".to_string(),
+            svc_keys.clone(),
+            km_svc_pk,
+            keys_a.public_key(),
+        );
+
+        // Session B with ssh channel (different keys)
+        let svc_keys_b = Keys::generate();
+        mgr.create_root_session(
+            sid_b,
+            keys_b.public_key(),
+            vec!["ssh".to_string()],
+            "bob".to_string(),
+            vec![],
+            None,
+        );
+        mgr.add_service_channel(
+            sid_b,
+            "ssh".to_string(),
+            svc_keys_b.clone(),
+            km_svc_pk,
+            keys_b.public_key(),
+        );
+
+        // Remove session A
+        mgr.remove_session(&sid_a);
+
+        // find_service_channel should return session B's channel
+        let result = mgr.find_service_channel("ssh");
+        assert!(result.is_some());
+        let (found_keys, _, _) = result.unwrap();
+        assert_eq!(found_keys.public_key(), svc_keys_b.public_key());
+    }
+
+    #[test]
+    fn test_remove_session_sends_shutdown() {
+        let mut mgr = SessionManager::new();
+        let km_keys = Keys::generate();
+        let sid = random_event_id();
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        mgr.create_root_session(
+            sid,
+            km_keys.public_key(),
+            vec!["ssh".to_string()],
+            "alice".to_string(),
+            vec![],
+            Some(shutdown_tx),
+        );
+
+        // Remove session — should send shutdown signal
+        mgr.remove_session(&sid);
+
+        // The receiver should see the shutdown signal
+        assert_eq!(*shutdown_rx.borrow(), true);
+    }
+}

@@ -569,6 +569,16 @@ async fn handle_attach(
     let attached_session_event_id = event.id;
     {
         let mut mgr = session_mgr.write().await;
+        // Evict stale session from same KM pubkey (e.g. phone reconnected
+        // after sleep without detaching first)
+        if let Some(old_sid) = mgr.find_session_by_km_pubkey(km_pubkey) {
+            warn!(
+                "Evicting stale session {} from KM pubkey {} \
+                 (new attach replacing old)",
+                old_sid, km_pubkey.to_hex()
+            );
+            mgr.remove_session(&old_sid);
+        }
         mgr.create_root_session(
             attached_session_event_id,
             *km_pubkey,
