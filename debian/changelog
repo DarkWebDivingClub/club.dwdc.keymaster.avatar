@@ -1,3 +1,11 @@
+keymaster-avatar (0.3.0-2) unstable; urgency=medium
+
+  * Mission 23 — Transparent environment propagation
+  * Add environment.d drop-in (50-keymaster.conf) for systemd sessions
+  * Add profile.d script (keymaster.sh) for shell logins
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 21 Jul 2026 12:00:00 +0200
+
 keymaster-avatar (0.3.0-1) unstable; urgency=medium
 
   * Mission 22.7 — Restore NipXX connection after sleep
