@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
     let qr_payload = serde_json::json!({
         "relay": &relay,
         "login_xpub": login_xpub.to_string(),
-        "services": ["ssh", "gpg"]
+        "services": ["ssh", "gpg", "nostr"]
     });
     let qr_json = serde_json::to_string(&qr_payload)?;
     display_qr(&qr_json);
