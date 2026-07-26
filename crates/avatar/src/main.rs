@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
     let descriptor = serde_json::json!({
         "relay": &relay,
         "login_xpub": login_xpub.to_string(),
-        "services": ["ssh", "gpg"]
+        "services": ["ssh", "gpg", "nostr"]
     });
     let descriptor_json = serde_json::to_string_pretty(&descriptor)?;
 

@@ -4,6 +4,7 @@ members = [
     "crates/avatar",
     "crates/avatar-protocol",
     "crates/km-gpg-sa",
+    "crates/km-nostr-sa",
     "crates/scd-shim",
     "crates/pkcs11-gpg",
     "crates/km-ssh-sa",
