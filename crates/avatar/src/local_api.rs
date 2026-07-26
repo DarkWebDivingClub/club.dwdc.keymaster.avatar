@@ -18,6 +18,43 @@ use crate::protocol::PROTOCOL_KIND;
 use crate::session::SessionManager;
 use crate::PendingResponses;
 
+/// Start a default API socket listener at `socket_path`.
+///
+/// Used in single-user / development mode (no user map). The socket is
+/// created at the given path with default permissions and is available
+/// immediately for service avatar processes to connect.
+pub async fn start_default_listener(
+    socket_path: &Path,
+    avatar_keys: Arc<Keys>,
+    client: Arc<Client>,
+    session_mgr: Arc<RwLock<SessionManager>>,
+    pending: PendingResponses,
+) -> Result<()> {
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    info!("Local API listening on: {}", socket_path.display());
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    debug!("Local API: new connection");
+                    let keys = avatar_keys.clone();
+                    let cli = client.clone();
+                    let mgr = session_mgr.clone();
+                    let pend = pending.clone();
+                    tokio::spawn(handle_connection(stream, keys, cli, mgr, pend));
+                }
+                Err(e) => {
+                    error!("Local API accept error: {}", e);
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
 /// Start a per-user API socket listener at `<socket_dir>/api-<uid>.sock`.
 ///
 /// The socket is chowned to the target user and chmoded to 0700 so only
