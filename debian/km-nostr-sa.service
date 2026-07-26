@@ -1,0 +1,14 @@
+[Unit]
+Description=KeyMaster Nostr service avatar
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/keymaster-avatar/bin/km-nostr-sa \
+    --avatar-socket /run/keymaster-avatar/api-%U.sock \
+    --listen-socket %t/keymaster-nostr-sa.sock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

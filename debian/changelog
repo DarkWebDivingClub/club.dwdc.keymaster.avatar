@@ -1,3 +1,12 @@
+keymaster-avatar (0.4.0-1) unstable; urgency=medium
+
+  * Mission 24 — km-nostr-sa: Nostr signing service avatar
+  * Add km-nostr-sa binary and systemd user unit
+  * Add "nostr" to avatar descriptor services list
+  * Fix single-user socket mode for development and Docker
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 21 Jul 2026 18:00:00 +0200
+
 keymaster-avatar (0.3.0-2) unstable; urgency=medium
 
   * Mission 23 — Transparent environment propagation
