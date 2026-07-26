@@ -117,6 +117,28 @@ fn translate_request_params(method: &str, params: &mut Value) {
             hex_to_base64_field(params, "public_key");
             hex_to_base64_field(params, "peer_public_key");
         }
+        "get_mls_pubkey" => {
+            hex_to_base64_field(params, "nostr_pubkey");
+        }
+        "mls_sign" => {
+            hex_to_base64_field(params, "mls_pubkey");
+            hex_to_base64_field(params, "data");
+        }
+        "sign_account_identity_proof" => {
+            hex_to_base64_field(params, "account_identity");
+            hex_to_base64_field(params, "mls_signature_public_key");
+        }
+        "mls_hpke_pubkey_at" => {
+            hex_to_base64_field(params, "mls_pubkey");
+        }
+        "mls_hpke_dh" | "mls_hpke_decap" => {
+            hex_to_base64_field(params, "hpke_pubkey");
+            hex_to_base64_field(params, "peer_public");
+        }
+        "mls_next_hpke_init_key" => {
+            hex_to_base64_field(params, "mls_pubkey");
+            hex_to_base64_field(params, "current_hpke_pubkey");
+        }
         _ => {}
     }
 }
@@ -134,6 +156,18 @@ fn translate_response_result(method: &str, result: &mut Value) {
         }
         "sign_event" => {
             base64_to_hex_field(result, "signature");
+        }
+        "get_mls_pubkey" => {
+            base64_to_hex_field(result, "mls_pubkey");
+        }
+        "mls_sign" | "sign_account_identity_proof" => {
+            base64_to_hex_field(result, "signature");
+        }
+        "mls_hpke_pubkey_at" | "mls_next_hpke_init_key" => {
+            base64_to_hex_field(result, "hpke_pubkey");
+        }
+        "mls_hpke_dh" | "mls_hpke_decap" => {
+            base64_to_hex_field(result, "dh_result");
         }
         // encrypt/decrypt responses contain string fields — no translation needed
         _ => {}
