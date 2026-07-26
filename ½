@@ -1,0 +1,7 @@
+# Map Nostr pubkeys to Unix users.
+# [[user]]
+# npub = "hex-pubkey"
+# unix_user = "username"
+[[user]]
+npub = ""
+unix_user = "rene"

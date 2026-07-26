@@ -1,0 +1,3 @@
+/etc/keymaster-avatar/avatar.toml
+/etc/keymaster-avatar/users.toml
+/etc/profile.d/keymaster.sh

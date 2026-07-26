@@ -1,0 +1,10 @@
+# KeyMaster Avatar configuration
+# CLI flags override these settings.
+
+relay = "ws://localhost:7777"
+log_level = "info"
+# seed_file = "/var/lib/keymaster-avatar/seed"  # default; override to use a different path
+local_api_socket = "/run/keymaster-avatar"
+users_file = "/etc/keymaster-avatar/users.toml"
+descriptor_path = "/run/keymaster-avatar/descriptor.json"
+service_avatar_dir = "/usr/lib/keymaster-avatar/bin"

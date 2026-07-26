@@ -1,0 +1,11 @@
+Package: keymaster-avatar
+Version: 0.4.0-1
+Architecture: amd64
+Maintainer: Rene Malmgren <duke_h3@dwdc.club>
+Installed-Size: 18442
+Depends: libc6 (>= 2.39), libgcc-s1 (>= 4.2), gnupg, openssh-client
+Section: utils
+Priority: optional
+Description: KeyMaster Avatar daemon and service avatars
+ Nostr-based key service relay with SSH, GPG, and Nostr service avatars
+ for remote cryptographic key operations.

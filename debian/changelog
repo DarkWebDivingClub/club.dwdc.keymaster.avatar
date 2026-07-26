@@ -1,3 +1,10 @@
+keymaster-avatar (0.4.0-2) unstable; urgency=medium
+
+  * Mission 25 — MLS hex/base64 translation in km-nostr-sa
+  * Add request/response translation for 7 MLS methods
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Sat, 26 Jul 2026 18:00:00 +0200
+
 keymaster-avatar (0.4.0-1) unstable; urgency=medium
 
   * Mission 24 — km-nostr-sa: Nostr signing service avatar

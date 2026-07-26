@@ -1,0 +1,55 @@
+keymaster-avatar (0.4.0-1) unstable; urgency=medium
+
+  * Mission 24 — km-nostr-sa: Nostr signing service avatar
+  * Add km-nostr-sa binary and systemd user unit
+  * Add "nostr" to avatar descriptor services list
+  * Fix single-user socket mode for development and Docker
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 21 Jul 2026 18:00:00 +0200
+
+keymaster-avatar (0.3.0-2) unstable; urgency=medium
+
+  * Mission 23 — Transparent environment propagation
+  * Add environment.d drop-in (50-keymaster.conf) for systemd sessions
+  * Add profile.d script (keymaster.sh) for shell logins
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 21 Jul 2026 12:00:00 +0200
+
+keymaster-avatar (0.3.0-1) unstable; urgency=medium
+
+  * Mission 22.7 — Restore NipXX connection after sleep
+  * Evict stale session on duplicate attach from same KM pubkey
+  * Session eviction unit tests
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Wed, 16 Jul 2026 12:00:00 +0200
+
+keymaster-avatar (0.2.0-3) unstable; urgency=medium
+
+  * Systemd deployment (Mission 20)
+  * Add km-avatar.service (system unit, User=km-avatar, CAP_CHOWN)
+  * Add km-ssh-sa.service and km-gpg-sa.service (user units)
+  * Add per-user API sockets (/run/keymaster-avatar/api-UID.sock)
+  * Add user mapping module (users.toml: npub → unix user)
+  * Add descriptor export (--descriptor-path)
+  * Remove service avatar spawning (now systemd user services)
+  * Add reconnection logic to km-ssh-sa and km-gpg-sa
+  * Create km-avatar system user via postinst
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 30 Jun 2026 16:00:00 +0200
+
+keymaster-avatar (0.2.0-2) unstable; urgency=medium
+
+  * Move daemon to /usr/bin (FHS-conventional placement)
+  * Set service_avatar_dir in default config
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 30 Jun 2026 00:00:00 +0200
+
+keymaster-avatar (0.2.0) unstable; urgency=medium
+
+  * Initial Debian packaging
+  * TOML config file support (/etc/keymaster-avatar/)
+  * Sibling binary resolution for service avatars
+  * scd-shim runtime resolution
+  * PKCS#11 library renamed to km_pkcs11_gpg
+
+ -- Rene Malmgren <duke_h3@dwdc.club>  Sun, 29 Jun 2026 23:00:00 +0200

@@ -1,0 +1,3 @@
+keymaster-avatar-dbgsym_0.4.0-1_amd64.ddeb debug optional architecture=amd64 automatic=yes
+keymaster-avatar_0.4.0-1_amd64.buildinfo utils optional
+keymaster-avatar_0.4.0-1_amd64.deb utils optional architecture=amd64
