@@ -1,17 +1,17 @@
-keymaster-avatar (0.5.0-1) unstable; urgency=medium
+keymaster-avatar (0.5.0-1) resolute; urgency=medium
 
   * Mission 25 — MLS hex/base64 translation in km-nostr-sa
   * Add request/response translation for 7 MLS methods
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Sat, 26 Jul 2026 22:00:00 +0200
 
-keymaster-avatar (0.4.0-2) unstable; urgency=medium
+keymaster-avatar (0.4.0-2) resolute; urgency=medium
 
   * Mission 25 — MLS hex/base64 translation in km-nostr-sa (pre-release)
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Sat, 26 Jul 2026 18:00:00 +0200
 
-keymaster-avatar (0.4.0-1) unstable; urgency=medium
+keymaster-avatar (0.4.0-1) resolute; urgency=medium
 
   * Mission 24 — km-nostr-sa: Nostr signing service avatar
   * Add km-nostr-sa binary and systemd user unit
@@ -20,7 +20,7 @@ keymaster-avatar (0.4.0-1) unstable; urgency=medium
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 21 Jul 2026 18:00:00 +0200
 
-keymaster-avatar (0.3.0-2) unstable; urgency=medium
+keymaster-avatar (0.3.0-2) resolute; urgency=medium
 
   * Mission 23 — Transparent environment propagation
   * Add environment.d drop-in (50-keymaster.conf) for systemd sessions
@@ -28,7 +28,7 @@ keymaster-avatar (0.3.0-2) unstable; urgency=medium
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 21 Jul 2026 12:00:00 +0200
 
-keymaster-avatar (0.3.0-1) unstable; urgency=medium
+keymaster-avatar (0.3.0-1) resolute; urgency=medium
 
   * Mission 22.7 — Restore NipXX connection after sleep
   * Evict stale session on duplicate attach from same KM pubkey
@@ -36,7 +36,7 @@ keymaster-avatar (0.3.0-1) unstable; urgency=medium
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Wed, 16 Jul 2026 12:00:00 +0200
 
-keymaster-avatar (0.2.0-3) unstable; urgency=medium
+keymaster-avatar (0.2.0-3) resolute; urgency=medium
 
   * Systemd deployment (Mission 20)
   * Add km-avatar.service (system unit, User=km-avatar, CAP_CHOWN)
@@ -50,14 +50,14 @@ keymaster-avatar (0.2.0-3) unstable; urgency=medium
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 30 Jun 2026 16:00:00 +0200
 
-keymaster-avatar (0.2.0-2) unstable; urgency=medium
+keymaster-avatar (0.2.0-2) resolute; urgency=medium
 
   * Move daemon to /usr/bin (FHS-conventional placement)
   * Set service_avatar_dir in default config
 
  -- Rene Malmgren <duke_h3@dwdc.club>  Mon, 30 Jun 2026 00:00:00 +0200
 
-keymaster-avatar (0.2.0) unstable; urgency=medium
+keymaster-avatar (0.2.0) resolute; urgency=medium
 
   * Initial Debian packaging
   * TOML config file support (/etc/keymaster-avatar/)
