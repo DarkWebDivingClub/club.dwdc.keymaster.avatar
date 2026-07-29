@@ -42,8 +42,9 @@ sudo apt install qrencode
 
 ## Install
 
-Install the packages from `.deb` files. Pre-built APT packages are
-planned for a future release.
+### Option A: Install from `.deb` packages
+
+If you have pre-built `.deb` files:
 
 | Package | Provides | Description |
 |---------|----------|-------------|
@@ -55,7 +56,48 @@ sudo dpkg -i strfry_*.deb
 sudo dpkg -i keymaster-avatar_*.deb
 ```
 
-Verify the binaries are installed:
+### Option B: Build from source
+
+Install build dependencies:
+
+```bash
+sudo apt install build-essential pkg-config libssl-dev
+```
+
+Build the Avatar and service avatars:
+
+```bash
+git clone https://github.com/DarkWebDivingClub/club.dwdc.keymaster.avatar.git
+cd club.dwdc.keymaster.avatar
+cargo build --release
+```
+
+The binaries are in `target/release/`. Install them:
+
+```bash
+sudo install -t /usr/local/bin \
+  target/release/keymaster-avatar \
+  target/release/km-ssh-sa \
+  target/release/km-gpg-sa \
+  target/release/km-nostr-sa \
+  target/release/scd-shim
+```
+
+Build and install strfry (the Nostr relay) separately:
+
+```bash
+git clone https://github.com/DarkWebDivingClub/strfry.git
+cd strfry
+make setup-golpe
+make -j$(nproc)
+sudo install -m 755 strfry /usr/local/bin/
+```
+
+When building from source, you will also need to create the systemd
+unit files manually. See the `debian/` directory on the
+`packaging/ubuntu/resolute` branch for reference.
+
+### Verify
 
 ```bash
 which keymaster-avatar km-ssh-sa km-gpg-sa km-nostr-sa
@@ -69,6 +111,8 @@ If you want to run KeyMaster on the desktop instead of the phone
 (for testing or development), also install these packages. They are
 **not needed** when using the phone as your KeyMaster.
 
+From `.deb` files:
+
 | Package | Provides | Description |
 |---------|----------|-------------|
 | `keymaster-desktop` | km-daemon, km-cli | KeyMaster daemon and CLI |
@@ -77,6 +121,19 @@ If you want to run KeyMaster on the desktop instead of the phone
 ```bash
 sudo dpkg -i keymaster-desktop_*.deb
 sudo dpkg -i keyvault-cli_*.deb
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/DarkWebDivingClub/club.dwdc.keymaster.git
+cd club.dwdc.keymaster
+mvn -pl club.dwdc.keymaster.cli,club.dwdc.keymaster.daemon,club.dwdc.keymaster.desktop \
+  -am package -DskipTests
+
+git clone https://github.com/DarkWebDivingClub/club.dwdc.keyvault.git
+cd club.dwdc.keyvault
+mvn -pl club.dwdc.keyvault.cli -am package -DskipTests
 ```
 
 ## Configure User Mapping
