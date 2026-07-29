@@ -1,4 +1,4 @@
-keymaster-avatar (0.5.0-1) trixie; urgency=medium
+keymaster-avatar (0.5.0-1+deb13) trixie; urgency=medium
 
   * Mission 25 — MLS hex/base64 translation in km-nostr-sa
   * Add request/response translation for 7 MLS methods
