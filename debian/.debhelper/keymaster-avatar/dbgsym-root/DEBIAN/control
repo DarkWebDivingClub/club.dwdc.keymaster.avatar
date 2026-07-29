@@ -1,13 +1,13 @@
 Package: keymaster-avatar-dbgsym
 Package-Type: ddeb
 Source: keymaster-avatar
-Version: 0.4.0-1
+Version: 0.5.0-1
 Auto-Built-Package: debug-symbols
 Architecture: amd64
 Maintainer: Rene Malmgren <duke_h3@dwdc.club>
-Installed-Size: 8915
-Depends: keymaster-avatar (= 0.4.0-1)
+Installed-Size: 8914
+Depends: keymaster-avatar (= 0.5.0-1)
 Section: debug
 Priority: optional
 Description: debug symbols for keymaster-avatar
-Build-Ids: 0889afdf7058bd0d6b85ad65013aa1b00e655e27 413598b48c58c84fd7cb9216cb4a5e6246231177 556604d06e9bad65c2ea7bef6b60d55eabd91efb 8f5ace2ca565b5561052c2dc9b86b57dddda332a b36f3b813be6b39f088b6ca21a6b7efb8f43fcac dccb5a4996cc2fb8ed8df6b45e8cde6346c6f0b9
+Build-Ids: 0478601dfe7ea6b9fbbd413671acf8b746231177 24ec4e9499e6f7be16d737c41680934dddda332a 2fa0134b9c94203e2fa1d9f25f338c8546c6f0b9 61bfe62bba70df9752bc2aaba86f36d3465d937d 6c8afb716d032135334deddfa765a1470e655e27 a78a18e69335822764c547ccb5cb8442be43f0c6
