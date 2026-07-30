@@ -5,16 +5,19 @@ clients) use cryptographic keys stored on your phone. The phone
 holds the private keys and signs remotely — nothing secret is ever
 stored on the desktop.
 
+You can also run KeyMaster on the desktop itself (without a phone)
+using `keymaster-desktop`. This guide focuses on the phone-based
+setup. The host-based option is covered at the end.
+
 This guide takes you from a fresh install to working SSH, GPG, and
 Nostr signing.
 
 ## 1. Requirements
 
 - Debian 13 (Trixie) or Ubuntu 24.04 (Noble) on amd64
-- An Android phone with the KeyMaster app installed
-  (see [KeyMaster Android](https://github.com/DarkWebDivingClub/club.dwdc.keymaster.android))
-- A network path from phone to desktop (USB cable, WiFi, or
-  remote tunnel)
+- An Android phone with the KeyMaster app installed and configured
+  (see [Getting Started with KeyMaster Android](https://github.com/DarkWebDivingClub/club.dwdc.keymaster.android/blob/master/getting-started-newbi.md))
+- Phone and desktop on the same WiFi network
 
 Install `qrencode` for displaying the QR code the phone scans:
 
@@ -22,21 +25,33 @@ Install `qrencode` for displaying the QR code the phone scans:
 sudo apt install qrencode
 ```
 
-## 2. Install
+## 2. Add the APT repository
 
-### From `.deb` packages
+```bash
+curl -fsSL https://apt.dwdc.club/dwdc-apt-repo.gpg \
+  | sudo tee /usr/share/keyrings/dwdc-apt.gpg > /dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/dwdc-apt.gpg] https://apt.dwdc.club resolute alfa" \
+  | sudo tee /etc/apt/sources.list.d/dwdc.list
+
+sudo apt update
+```
+
+## 3. Install
+
+```bash
+sudo apt install strfry keymaster-avatar
+```
+
+If the packages are not yet available in the APT repository,
+install from `.deb` files instead:
 
 ```bash
 sudo dpkg -i strfry_*.deb
 sudo dpkg -i keymaster-avatar_*.deb
 ```
 
-### From source
-
-See [Getting Started — Developer](getting-started-developer.md)
-for build instructions.
-
-### Verify
+Verify the binaries are installed:
 
 ```bash
 which keymaster-avatar km-ssh-sa km-gpg-sa km-nostr-sa
@@ -44,7 +59,7 @@ which keymaster-avatar km-ssh-sa km-gpg-sa km-nostr-sa
 
 You should see four paths printed, one per line.
 
-## 3. Configure user mapping
+## 4. Configure user mapping
 
 The Avatar maps phone identities to Unix users. Edit
 `/etc/keymaster-avatar/users.toml`:
@@ -61,7 +76,23 @@ Replace the npub with the hex public key from the KeyMaster app's
 home screen (tap the copy button next to "Public Key (hex)").
 Replace `alice` with your Unix username.
 
-## 4. Enable system services
+## 5. Configure relay URL
+
+The default relay URL is `ws://localhost:7777`. Change it to the
+desktop's WiFi IP so the phone can reach the relay:
+
+```bash
+# Find the desktop's WiFi IP
+ip -4 addr show | grep 'inet ' | grep -v '127.0.0.1'
+
+# Update avatar config (replace 192.168.1.42 with your IP)
+sudo sed -i 's|ws://.*:7777|ws://192.168.1.42:7777|' \
+  /etc/keymaster-avatar/avatar.toml
+```
+
+Make sure the firewall allows incoming connections on port 7777.
+
+## 6. Enable system services
 
 ```bash
 sudo systemctl enable --now strfry
@@ -81,8 +112,9 @@ cat /run/keymaster-avatar/descriptor.json
 ```
 
 You should see JSON with `relay`, `login_xpub`, and `services`.
+The relay URL should match the IP you configured.
 
-## 5. Enable user services
+## 7. Enable user services
 
 ```bash
 systemctl --user enable --now km-ssh-sa
@@ -99,77 +131,29 @@ systemctl --user status km-ssh-sa km-gpg-sa km-nostr-sa
 All three should be `active (running)`. They will wait for a phone
 to attach before handling requests — this is normal.
 
-## 6. Connect the phone
+## 8. Set up the phone
 
-The phone must reach the Nostr relay on the desktop. Choose the
-method that matches your situation.
+If you have not yet installed and configured the KeyMaster Android
+app, follow the
+[Getting Started with KeyMaster Android](https://github.com/DarkWebDivingClub/club.dwdc.keymaster.android/blob/master/getting-started-newbi.md)
+guide to:
 
-### At home or office — USB via ADB reverse
+1. Install the app
+2. Generate or import a BIP-39 seed phrase
+3. Create an identity (e.g. `alice@atlanta.com`)
 
-Connect the phone via USB with USB debugging enabled:
+Come back here once the app is running and shows your identity on
+the home screen.
 
-```bash
-adb reverse tcp:7777 tcp:7777
-```
+## 9. Connect the phone
 
-The descriptor's default `ws://localhost:7777` works as-is. Re-run
-this command after USB disconnect or phone reboot.
-
-### At home or office — same WiFi
-
-If both devices are on the same WiFi, set the relay URL to the
-desktop's LAN IP:
-
-```bash
-# Find the desktop's LAN IP
-ip -4 addr show | grep 'inet ' | grep -v '127.0.0.1'
-
-# Update avatar config (replace 192.168.1.42 with your IP)
-sudo sed -i 's|ws://.*:7777|ws://192.168.1.42:7777|' \
-  /etc/keymaster-avatar/avatar.toml
-
-# Restart to regenerate the descriptor
-sudo systemctl restart km-avatar
-```
-
-Make sure the firewall allows incoming connections on port 7777.
-
-### Traveling — phone on hotel/cafe WiFi
-
-When you are away from home, the desktop's LAN IP changes with
-every network. You have two options:
-
-**Option A: USB cable (simplest).** Plug in the phone and run
-`adb reverse tcp:7777 tcp:7777`. This always works regardless of
-what network you are on.
-
-**Option B: Expose the relay over an SSH tunnel.** If the phone
-cannot be connected via USB, forward port 7777 through an SSH
-tunnel to a server the phone can reach:
-
-```bash
-# From the desktop, forward local strfry to a remote server
-ssh -R 7777:localhost:7777 you@your-server.example.com
-```
-
-Then create a modified QR code pointing at the server:
-
-```bash
-cat /run/keymaster-avatar/descriptor.json \
-  | sed 's|ws://[^"]*|ws://your-server.example.com:7777|' \
-  | qrencode -t UTF8
-```
-
-The server must allow inbound connections on port 7777. The tunnel
-must stay open while the phone is attached.
-
-### Display the QR code
+Display the QR code on the desktop:
 
 ```bash
 qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
 ```
 
-### Attach from the phone
+On the phone:
 
 1. Open the **KeyMaster** app
 2. Tap **Attach to Avatar** on the Avatar card
@@ -183,10 +167,11 @@ You should see:
 
 ```bash
 ls -la /run/keymaster-avatar/api-$(id -u).sock
-# Should show a socket file owned by your user
 ```
 
-## 7. Set environment variables
+You should see a socket file owned by your user.
+
+## 10. Set environment variables
 
 ```bash
 export SSH_AUTH_SOCK=$XDG_RUNTIME_DIR/keymaster-ssh-agent.sock
@@ -197,7 +182,7 @@ export NOSTR_SA_SOCK=$XDG_RUNTIME_DIR/keymaster-nostr-sa.sock
 After logging out and back in, these are set automatically. You
 only need the manual `export` for your current terminal session.
 
-## 8. Verify SSH
+## 11. Verify SSH
 
 ```bash
 ssh-add -l
@@ -209,7 +194,7 @@ You should see:
 256 SHA256:xxxx alice@atlanta.com (ED25519)
 ```
 
-## 9. Verify GPG
+## 12. Verify GPG
 
 ```bash
 gpg --list-keys alice@atlanta.com
@@ -218,7 +203,7 @@ echo "test" | gpg --clearsign
 
 You should see a PGP signed message.
 
-## 10. Verify Nostr
+## 13. Verify Nostr
 
 ```bash
 ls -la $NOSTR_SA_SOCK
@@ -291,6 +276,37 @@ qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
 | Seed file | Kept | Deleted and regenerated |
 | Config files | Kept | Kept |
 
+## Optional: host-based KeyMaster
+
+Instead of using the phone, you can run KeyMaster directly on the
+desktop. Install the additional packages:
+
+```bash
+sudo apt install keymaster-desktop keyvault-cli
+```
+
+Or from `.deb` files:
+
+```bash
+sudo dpkg -i keymaster-desktop_*.deb
+sudo dpkg -i keyvault-cli_*.deb
+```
+
+Enable the daemon, import a seed, create an identity, and attach:
+
+```bash
+systemctl --user enable --now km-daemon
+echo "your twenty-four word seed phrase here" | kv-cli seed import
+km-cli identity create alice@atlanta.com
+km-cli attach /run/keymaster-avatar/descriptor.json \
+  --identity alice@atlanta.com --policy auto
+```
+
+You should see: `Attached. Session: <sessionId>`
+
+Then continue with step 10 (environment variables) and the
+verification steps.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -299,8 +315,8 @@ qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
 | `ssh-add -l` says "no identities" | Phone not attached. Re-scan QR and attach. |
 | `gpg: No secret key` | `export GNUPGHOME=$XDG_RUNTIME_DIR/gnupg-keymaster` and restart km-gpg-sa |
 | `descriptor.json` not found | `sudo systemctl restart km-avatar` |
-| Phone stuck on "Reconnecting..." | USB: re-run `adb reverse tcp:7777 tcp:7777`. WiFi: check IP and firewall. |
+| Phone stuck on "Reconnecting..." | Check that the desktop's WiFi IP has not changed. Check firewall on port 7777. |
 | Permission denied on API socket | npub in `users.toml` does not match the phone's identity |
 
 See [doc/RECONNECT.md](doc/RECONNECT.md) for the full reconnection
-procedure after sleep, travel, or network changes.
+procedure after sleep or network changes.
