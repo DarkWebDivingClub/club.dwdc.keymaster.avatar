@@ -14,7 +14,7 @@ Nostr signing.
 
 ## 1. Requirements
 
-- Debian 13 (Trixie) or Ubuntu 24.04 (Noble) on amd64
+- Ubuntu 26.04 (Resolute) or Debian 13 (Trixie) on amd64
 - An Android phone with the KeyMaster app installed and configured
   (see [Getting Started with KeyMaster Android](https://github.com/DarkWebDivingClub/club.dwdc.keymaster.android/blob/master/getting-started-newbi.md))
 - Phone and desktop on the same WiFi network
@@ -27,11 +27,25 @@ sudo apt install qrencode
 
 ## 2. Add the APT repository
 
+### Ubuntu 26.04 (Resolute)
+
 ```bash
 curl -fsSL https://apt.dwdc.club/dwdc-apt-repo.gpg \
   | sudo tee /usr/share/keyrings/dwdc-apt.gpg > /dev/null
 
 echo "deb [signed-by=/usr/share/keyrings/dwdc-apt.gpg] https://apt.dwdc.club resolute alfa" \
+  | sudo tee /etc/apt/sources.list.d/dwdc.list
+
+sudo apt update
+```
+
+### Debian 13 (Trixie)
+
+```bash
+curl -fsSL https://apt.dwdc.club/dwdc-apt-repo.gpg \
+  | sudo tee /usr/share/keyrings/dwdc-apt.gpg > /dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/dwdc-apt.gpg] https://apt.dwdc.club trixie alfa" \
   | sudo tee /etc/apt/sources.list.d/dwdc.list
 
 sudo apt update
