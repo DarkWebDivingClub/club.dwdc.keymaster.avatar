@@ -90,6 +90,32 @@ fn resolve_scdaemon_program(cli_value: Option<&str>, config_value: Option<&std::
     PathBuf::from("/usr/local/bin/scd-shim")
 }
 
+/// Connect to the avatar socket with exponential backoff.
+/// Retries until the connection succeeds.
+async fn connect_with_retry(socket_path: &std::path::Path) -> UnixStream {
+    let mut delay = std::time::Duration::from_secs(1);
+    let max_delay = std::time::Duration::from_secs(30);
+
+    loop {
+        match UnixStream::connect(socket_path).await {
+            Ok(stream) => {
+                info!("Connected to avatar local API: {}", socket_path.display());
+                return stream;
+            }
+            Err(e) => {
+                warn!(
+                    "Cannot connect to {}: {} — retrying in {:?}",
+                    socket_path.display(),
+                    e,
+                    delay
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(max_delay);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -139,15 +165,10 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Step 1: Connect to avatar local API
-    info!(
-        "Connecting to avatar local API: {}",
-        avatar_socket.display()
-    );
-    let avatar_stream = UnixStream::connect(&avatar_socket).await?;
+    // Step 1: Connect to avatar local API (with retry)
+    let avatar_stream = connect_with_retry(&avatar_socket).await;
     let (reader, mut avatar_writer) = avatar_stream.into_split();
     let mut avatar_reader = BufReader::new(reader);
-    info!("Connected to avatar local API");
 
     // Send connect message (JSON-RPC 2.0)
     let connect_req = JsonRpcRequest::new(
@@ -341,7 +362,7 @@ async fn main() -> Result<()> {
     // Step 9: Ready
     info!("GPG ready — proxy active on {}", gpg_socket.display());
 
-    // Step 10: Wait for proxy to end (killed by avatar kill_on_drop)
+    // Step 10: Wait for proxy to end
     let _ = proxy_handle.await;
 
     // Cleanup on shutdown

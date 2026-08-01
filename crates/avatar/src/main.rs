@@ -2,6 +2,7 @@ mod local_api;
 mod protocol;
 mod seed;
 mod session;
+mod user_map;
 
 use anyhow::Result;
 use avatar_protocol::{JsonRpcMessage, JsonRpcResponse};
@@ -53,6 +54,14 @@ struct Cli {
     /// Path to identity allowlist file (one hex npub per line)
     #[arg(long, default_value = "~/.config/keymaster-avatar/allowlist")]
     allowlist: String,
+
+    /// Path to user mapping TOML file (npub → unix user)
+    #[arg(long, default_value = "/etc/keymaster-avatar/users.toml")]
+    users_file: PathBuf,
+
+    /// Path to write the descriptor JSON file
+    #[arg(long, default_value = "/etc/keymaster-avatar/descriptor.json")]
+    descriptor_path: PathBuf,
 }
 
 #[derive(Deserialize, Default)]
@@ -62,7 +71,8 @@ struct Config {
     local_api_socket: Option<PathBuf>,
     seed_file: Option<String>,
     allowlist: Option<String>,
-    service_avatar_dir: Option<PathBuf>,
+    users_file: Option<PathBuf>,
+    descriptor_path: Option<PathBuf>,
 }
 
 /// Pending response futures for service channel requests sent to KM.
@@ -129,17 +139,30 @@ async fn main() -> Result<()> {
             .local_api_socket
             .unwrap_or_else(|| cli.local_api_socket.clone())
     };
-    let seed_file = if cli.seed_file != "~/.config/keymaster-avatar/seed" {
+    let seed_file: String = if cli.seed_file != "~/.config/keymaster-avatar/seed" {
         cli.seed_file.clone()
     } else {
-        config.seed_file.unwrap_or_else(|| cli.seed_file.clone())
+        config.seed_file.unwrap_or_else(|| seed::DEFAULT_SEED_PATH.to_string())
     };
     let allowlist_str = if cli.allowlist != "~/.config/keymaster-avatar/allowlist" {
         cli.allowlist.clone()
     } else {
         config.allowlist.unwrap_or_else(|| cli.allowlist.clone())
     };
-    let service_avatar_dir = config.service_avatar_dir;
+    let users_file = if cli.users_file != PathBuf::from("/etc/keymaster-avatar/users.toml") {
+        cli.users_file.clone()
+    } else {
+        config
+            .users_file
+            .unwrap_or_else(|| cli.users_file.clone())
+    };
+    let descriptor_path = if cli.descriptor_path != PathBuf::from("/etc/keymaster-avatar/descriptor.json") {
+        cli.descriptor_path.clone()
+    } else {
+        config
+            .descriptor_path
+            .unwrap_or_else(|| cli.descriptor_path.clone())
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -158,10 +181,21 @@ async fn main() -> Result<()> {
     }
     let allowlist = Arc::new(allowlist);
 
-    // Load or create persistent seed
+    // Load user mapping (npub → unix user)
+    let user_map = match user_map::UserMap::load(&users_file) {
+        Ok(map) => {
+            info!("User map loaded from {}", users_file.display());
+            Some(Arc::new(map))
+        }
+        Err(e) => {
+            warn!("No user map loaded ({}): per-user sockets disabled", e);
+            None
+        }
+    };
+
+    // Resolve seed: read if exists, generate if not (errors if path not writable)
     let seed_path = expand_tilde(&seed_file);
-    let seed = seed::load_or_create_seed(&seed_path)?;
-    info!("Seed loaded from: {}", seed_path.display());
+    let seed = seed::resolve_seed(&seed_path)?;
 
     // Derive login keys at m/0
     let login_keys = seed::derive_login_keys(&seed, 0)?;
@@ -171,18 +205,31 @@ async fn main() -> Result<()> {
     info!("Avatar pubkey: {}", avatar_pubkey.to_hex());
     info!("Login xpub: {}", login_xpub);
 
-    // Display QR bootstrap payload
-    let qr_payload = serde_json::json!({
+    // Build descriptor payload (deterministic from seed)
+    let descriptor = serde_json::json!({
         "relay": &relay,
         "login_xpub": login_xpub.to_string(),
         "services": ["ssh", "gpg", "nostr"]
     });
-    let qr_json = serde_json::to_string(&qr_payload)?;
+    let descriptor_json = serde_json::to_string_pretty(&descriptor)?;
+
+    // Write descriptor file
+    if let Some(parent) = descriptor_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    match std::fs::write(&descriptor_path, &descriptor_json) {
+        Ok(()) => info!("Descriptor written to {}", descriptor_path.display()),
+        Err(e) => warn!("Failed to write descriptor to {}: {}", descriptor_path.display(), e),
+    }
+
+    // Display QR bootstrap payload
+    let qr_json = serde_json::to_string(&descriptor)?;
     display_qr(&qr_json);
     println!("\nQR Payload: {}", qr_json);
     println!("Relay: {}", relay);
     println!("Avatar pubkey: {}", avatar_pubkey.to_hex());
     println!("Login xpub: {}", login_xpub);
+    println!("Descriptor: {}", descriptor_path.display());
     println!("\nWaiting for KeyMaster attach...\n");
 
     // Create session manager and pending response tracker
@@ -206,24 +253,16 @@ async fn main() -> Result<()> {
     client.subscribe(vec![filter], None).await?;
     info!("Subscribed to kind {} events for #p={}", PROTOCOL_KIND, avatar_pubkey.to_hex());
 
-    // Start local API listener for service avatar processes
-    let avatar_keys_arc = Arc::new(avatar_keys.clone());
-    let client_arc = Arc::new(client.clone());
-    local_api::start_listener(
-        &local_api_socket,
-        avatar_keys_arc,
-        client_arc,
-        session_mgr.clone(),
-        pending_responses.clone(),
-    )
-    .await?;
-    println!("LOCAL_API_SOCK={}", local_api_socket.display());
+    // Ensure the API socket directory exists
+    std::fs::create_dir_all(&local_api_socket)?;
+    info!("API socket directory: {}", local_api_socket.display());
 
     // Store login keys in Arcs for use in the event loop
     let login_xpriv = Arc::new(login_keys.xpriv);
     let login_xpub_arc = Arc::new(login_xpub);
-    let service_avatar_dir = Arc::new(service_avatar_dir);
     let local_api_socket = Arc::new(local_api_socket);
+    let avatar_keys_arc = Arc::new(avatar_keys.clone());
+    let client_arc = Arc::new(client.clone());
 
     // Event loop
     let event_pending = pending_responses.clone();
@@ -237,7 +276,9 @@ async fn main() -> Result<()> {
             let login_xpub = login_xpub_arc.clone();
             let allowlist = allowlist.clone();
             let local_api_socket = local_api_socket.clone();
-            let service_avatar_dir = service_avatar_dir.clone();
+            let user_map = user_map.clone();
+            let avatar_keys_arc = avatar_keys_arc.clone();
+            let client_arc = client_arc.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
@@ -251,7 +292,9 @@ async fn main() -> Result<()> {
                             &login_xpub,
                             &allowlist,
                             &local_api_socket,
-                            service_avatar_dir.as_deref(),
+                            user_map.as_deref(),
+                            &avatar_keys_arc,
+                            &client_arc,
                             &event,
                         )
                         .await
@@ -277,7 +320,9 @@ async fn handle_event(
     login_xpub: &Xpub,
     allowlist: &HashSet<String>,
     local_api_socket: &std::path::Path,
-    service_avatar_dir: Option<&std::path::Path>,
+    user_map: Option<&user_map::UserMap>,
+    avatar_keys_arc: &Arc<Keys>,
+    client_arc: &Arc<Client>,
     event: &Event,
 ) -> Result<()> {
     let sender_pubkey = event.pubkey;
@@ -335,11 +380,14 @@ async fn handle_event(
                     avatar_keys,
                     client,
                     session_mgr,
+                    pending,
                     login_xpriv,
                     login_xpub,
                     allowlist,
                     local_api_socket,
-                    service_avatar_dir,
+                    user_map,
+                    avatar_keys_arc,
+                    client_arc,
                     event,
                     &sender_pubkey,
                     &msg,
@@ -400,11 +448,14 @@ async fn handle_attach(
     avatar_keys: &Keys,
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
+    pending: &PendingResponses,
     login_xpriv: &Xpriv,
     login_xpub: &Xpub,
     allowlist: &HashSet<String>,
-    local_api_socket: &std::path::Path,
-    service_avatar_dir: Option<&std::path::Path>,
+    local_api_socket_dir: &std::path::Path,
+    user_map: Option<&user_map::UserMap>,
+    avatar_keys_arc: &Arc<Keys>,
+    client_arc: &Arc<Client>,
     event: &Event,
     km_pubkey: &PublicKey,
     msg: &JsonRpcMessage,
@@ -563,8 +614,8 @@ async fn handle_attach(
         return Ok(());
     }
 
-    // Create shutdown channel for service process monitors
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Create shutdown channel (used by session manager on detach)
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
     let attached_session_event_id = event.id;
     {
@@ -642,13 +693,31 @@ async fn handle_attach(
         // all events via "login" marker p tag on KM→Avatar responses.
     }
 
-    // Spawn service process monitors for each service (km-{type}-sa binaries).
-    for (service_type, _seq) in &services {
-        let svc = service_type.clone();
-        let socket = local_api_socket.to_path_buf();
-        let rx = shutdown_rx.clone();
-        let sa_dir = service_avatar_dir.map(|p| p.to_path_buf());
-        tokio::spawn(service_monitor(svc, socket, sa_dir, rx));
+    // Create per-user API socket if user mapping exists
+    if let Some(map) = user_map {
+        if let Some(user_entry) = map.lookup(&identity) {
+            match local_api::start_user_listener(
+                local_api_socket_dir,
+                user_entry.uid,
+                user_entry.gid,
+                avatar_keys_arc.clone(),
+                client_arc.clone(),
+                session_mgr.clone(),
+                pending.clone(),
+            )
+            .await
+            {
+                Ok((_socket_path, api_shutdown)) => {
+                    let mut mgr = session_mgr.write().await;
+                    mgr.set_api_socket_shutdown(&attached_session_event_id, api_shutdown);
+                }
+                Err(e) => {
+                    error!("Failed to create per-user API socket for uid={}: {}", user_entry.uid, e);
+                }
+            }
+        } else {
+            warn!("No user mapping for identity {} — no per-user API socket", identity);
+        }
     }
 
     // Build accepted list
@@ -738,96 +807,6 @@ async fn send_response(
         reply_to
     );
     Ok(())
-}
-
-/// Resolve the path to a service avatar binary.
-///
-/// Search order:
-/// 1. `service_avatar_dir` from config — look for the binary there
-/// 2. Sibling of the current executable
-/// 3. Fall back to bare name (resolved via PATH)
-fn resolve_service_binary(service_type: &str, service_avatar_dir: Option<&std::path::Path>) -> PathBuf {
-    let name = format!("km-{}-sa", service_type);
-
-    // 1. Config override
-    if let Some(dir) = service_avatar_dir {
-        let path = dir.join(&name);
-        if path.exists() {
-            return path;
-        }
-    }
-
-    // 2. Sibling lookup
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let path = dir.join(&name);
-            if path.exists() {
-                return path;
-            }
-        }
-    }
-
-    // 3. PATH fallback
-    PathBuf::from(name)
-}
-
-/// Spawn a service avatar process (e.g. km-ssh-sa).
-async fn spawn_service_avatar(
-    service_type: &str,
-    avatar_socket: &std::path::Path,
-    service_avatar_dir: Option<&std::path::Path>,
-) -> Result<tokio::process::Child> {
-    let binary = resolve_service_binary(service_type, service_avatar_dir);
-    info!("Spawning service process: {} (socket: {})", binary.display(), avatar_socket.display());
-    let mut cmd = tokio::process::Command::new(&binary);
-    cmd.arg("--avatar-socket")
-        .arg(avatar_socket)
-        .arg("--log-level")
-        .arg("debug")
-        .kill_on_drop(true);
-    // Pass GNUPGHOME so km-gpg-sa knows where to set up GPG
-    if let Ok(gnupg_home) = std::env::var("GNUPGHOME") {
-        cmd.env("GNUPGHOME", &gnupg_home);
-    }
-    let child = cmd
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", binary.display(), e))?;
-    Ok(child)
-}
-
-/// Monitor a service process: respawn on crash, stop on shutdown signal.
-async fn service_monitor(
-    service_type: String,
-    avatar_socket: PathBuf,
-    service_avatar_dir: Option<PathBuf>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    loop {
-        let mut child = match spawn_service_avatar(&service_type, &avatar_socket, service_avatar_dir.as_deref()).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to spawn {}: {}", service_type, e);
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
-            }
-        };
-
-        tokio::select! {
-            status = child.wait() => {
-                match status {
-                    Ok(s) => warn!("Service process {} exited: {}", service_type, s),
-                    Err(e) => error!("Service process {} error: {}", service_type, e),
-                }
-                // Respawn after brief delay
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            _ = shutdown.changed() => {
-                info!("Shutdown signal for service {}, killing process", service_type);
-                let _ = child.kill().await;
-                return;
-            }
-        }
-    }
 }
 
 /// Canonical JSON: sort keys lexicographically, compact output.
