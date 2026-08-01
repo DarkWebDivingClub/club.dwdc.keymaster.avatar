@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=km-avatar
-AmbientCapabilities=CAP_CHOWN
+AmbientCapabilities=CAP_CHOWN CAP_SETUID CAP_SETGID
 ExecStart=/usr/bin/keymaster-avatar --config /etc/keymaster-avatar/avatar.toml
 Restart=on-failure
 RestartSec=5
