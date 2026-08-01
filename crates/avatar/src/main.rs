@@ -543,21 +543,11 @@ async fn handle_attach(
             }
         }
 
-        // Verify realm_xpub sender matches event pubkey
-        if let Some(realm_xpub_str) = connector.get("realm_xpub").and_then(|v| v.as_str()) {
-            if let Ok(rxpub) = Xpub::from_str(realm_xpub_str) {
-                let realm_pk_bytes = &rxpub.public_key.serialize()[1..]; // x-only from compressed
-                let sender_bytes = event.pubkey.serialize();
-                if realm_pk_bytes != sender_bytes {
-                    warn!("Connector realm_xpub does not match event sender");
-                    let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
-                    let response =
-                        JsonRpcResponse::error(id, -32602, "realm_xpub sender mismatch");
-                    send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
-                    return Ok(());
-                }
-            }
-        }
+        // NOTE: realm_xpub no longer matches the event sender pubkey.
+        // The transport key is now a stable device key (derived from vault),
+        // while realm_xpub is an ephemeral per-session key for service channel
+        // derivation. The connector_sig (identity-signed) authenticates the
+        // realm_xpub contents.
 
         // Verify Schnorr signature over canonical connector
         if let Some(sig_hex) = params.get("connector_sig").and_then(|v| v.as_str()) {
