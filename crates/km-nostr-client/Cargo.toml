@@ -1,0 +1,13 @@
+[package]
+name = "km-nostr-client"
+version = "0.1.0"
+edition = "2021"
+description = "Client library for km-nostr-sa — typed Rust API for KeyMaster Nostr and MLS operations"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
