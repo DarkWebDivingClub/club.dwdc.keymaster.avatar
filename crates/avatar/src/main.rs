@@ -53,6 +53,10 @@ struct Cli {
     /// Path to identity allowlist file (one hex npub per line)
     #[arg(long, default_value = "~/.config/keymaster-avatar/allowlist")]
     allowlist: String,
+
+    /// Path to users file mapping npub to Unix user
+    #[arg(long)]
+    users_file: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -63,6 +67,7 @@ struct Config {
     seed_file: Option<String>,
     allowlist: Option<String>,
     service_avatar_dir: Option<PathBuf>,
+    users_file: Option<PathBuf>,
 }
 
 /// Pending response futures for service channel requests sent to KM.
@@ -99,6 +104,34 @@ fn load_allowlist(path: &std::path::Path) -> HashSet<String> {
         set.insert(trimmed.to_string());
     }
     set
+}
+
+#[derive(Deserialize)]
+struct UsersConfig {
+    user: Vec<UserEntry>,
+}
+
+#[derive(Deserialize)]
+struct UserEntry {
+    npub: String,
+    unix_user: String,
+}
+
+/// Load user mapping from TOML file.
+/// Maps identity npub hex strings to Unix user names.
+fn load_users(path: &std::path::Path) -> HashMap<String, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let config: UsersConfig = match toml::from_str(&content) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Failed to parse users file: {}", e);
+            return HashMap::new();
+        }
+    };
+    config.user.into_iter().map(|u| (u.npub, u.unix_user)).collect()
 }
 
 #[tokio::main]
@@ -140,6 +173,7 @@ async fn main() -> Result<()> {
         config.allowlist.unwrap_or_else(|| cli.allowlist.clone())
     };
     let service_avatar_dir = config.service_avatar_dir;
+    let users_file = cli.users_file.map(|s| expand_tilde(&s)).or(config.users_file);
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -157,6 +191,21 @@ async fn main() -> Result<()> {
         info!("Identity allowlist loaded: {} entries from {}", allowlist.len(), allowlist_path.display());
     }
     let allowlist = Arc::new(allowlist);
+
+    // Load identity → Unix user mapping
+    let users = if let Some(ref path) = users_file {
+        let u = load_users(path);
+        if u.is_empty() {
+            info!("No user mappings loaded from {}", path.display());
+        } else {
+            info!("User mappings loaded: {} entries from {}", u.len(), path.display());
+        }
+        u
+    } else {
+        info!("No users_file configured (service avatars run as current user)");
+        HashMap::new()
+    };
+    let users = Arc::new(users);
 
     // Load or create persistent seed
     let seed_path = expand_tilde(&seed_file);
@@ -236,6 +285,7 @@ async fn main() -> Result<()> {
             let login_xpriv = login_xpriv.clone();
             let login_xpub = login_xpub_arc.clone();
             let allowlist = allowlist.clone();
+            let users = users.clone();
             let local_api_socket = local_api_socket.clone();
             let service_avatar_dir = service_avatar_dir.clone();
 
@@ -250,6 +300,7 @@ async fn main() -> Result<()> {
                             &login_xpriv,
                             &login_xpub,
                             &allowlist,
+                            &users,
                             &local_api_socket,
                             service_avatar_dir.as_deref(),
                             &event,
@@ -276,6 +327,7 @@ async fn handle_event(
     login_xpriv: &Xpriv,
     login_xpub: &Xpub,
     allowlist: &HashSet<String>,
+    users: &HashMap<String, String>,
     local_api_socket: &std::path::Path,
     service_avatar_dir: Option<&std::path::Path>,
     event: &Event,
@@ -338,6 +390,7 @@ async fn handle_event(
                     login_xpriv,
                     login_xpub,
                     allowlist,
+                    users,
                     local_api_socket,
                     service_avatar_dir,
                     event,
@@ -403,6 +456,7 @@ async fn handle_attach(
     login_xpriv: &Xpriv,
     login_xpub: &Xpub,
     allowlist: &HashSet<String>,
+    users: &HashMap<String, String>,
     local_api_socket: &std::path::Path,
     service_avatar_dir: Option<&std::path::Path>,
     event: &Event,
@@ -474,21 +528,11 @@ async fn handle_attach(
             }
         }
 
-        // Verify realm_xpub sender matches event pubkey
-        if let Some(realm_xpub_str) = connector.get("realm_xpub").and_then(|v| v.as_str()) {
-            if let Ok(rxpub) = Xpub::from_str(realm_xpub_str) {
-                let realm_pk_bytes = &rxpub.public_key.serialize()[1..]; // x-only from compressed
-                let sender_bytes = event.pubkey.serialize();
-                if realm_pk_bytes != sender_bytes {
-                    warn!("Connector realm_xpub does not match event sender");
-                    let id = msg.id.clone().unwrap_or(serde_json::Value::Null);
-                    let response =
-                        JsonRpcResponse::error(id, -32602, "realm_xpub sender mismatch");
-                    send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
-                    return Ok(());
-                }
-            }
-        }
+        // NOTE: realm_xpub no longer matches the event sender pubkey.
+        // The transport key is now a stable device key (derived from vault),
+        // while realm_xpub is an ephemeral per-session key for service channel
+        // derivation. The connector_sig (identity-signed) authenticates the
+        // realm_xpub contents.
 
         // Verify Schnorr signature over canonical connector
         if let Some(sig_hex) = params.get("connector_sig").and_then(|v| v.as_str()) {
@@ -561,6 +605,12 @@ async fn handle_attach(
         let response = JsonRpcResponse::error(id, -32602, "identity not in allowlist");
         send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
         return Ok(());
+    }
+
+    // --- Look up mapped Unix user for this identity ---
+    let unix_user = users.get(&identity).cloned();
+    if let Some(ref u) = unix_user {
+        info!("  Mapped Unix user: {}", u);
     }
 
     // Create shutdown channel for service process monitors
@@ -648,7 +698,8 @@ async fn handle_attach(
         let socket = local_api_socket.to_path_buf();
         let rx = shutdown_rx.clone();
         let sa_dir = service_avatar_dir.map(|p| p.to_path_buf());
-        tokio::spawn(service_monitor(svc, socket, sa_dir, rx));
+        let user = unix_user.clone();
+        tokio::spawn(service_monitor(svc, socket, sa_dir, user, rx));
     }
 
     // Build accepted list
@@ -776,6 +827,7 @@ async fn spawn_service_avatar(
     service_type: &str,
     avatar_socket: &std::path::Path,
     service_avatar_dir: Option<&std::path::Path>,
+    unix_user: Option<&str>,
 ) -> Result<tokio::process::Child> {
     let binary = resolve_service_binary(service_type, service_avatar_dir);
     info!("Spawning service process: {} (socket: {})", binary.display(), avatar_socket.display());
@@ -789,6 +841,18 @@ async fn spawn_service_avatar(
     if let Ok(gnupg_home) = std::env::var("GNUPGHOME") {
         cmd.env("GNUPGHOME", &gnupg_home);
     }
+    // Run as the mapped Unix user if configured
+    #[cfg(unix)]
+    if let Some(user_name) = unix_user {
+        use nix::unistd::User;
+        if let Ok(Some(user)) = User::from_name(user_name) {
+            cmd.uid(user.uid.as_raw());
+            cmd.gid(user.gid.as_raw());
+            info!("Spawning {} as user {} (uid={})", service_type, user_name, user.uid);
+        } else {
+            warn!("User '{}' not found, spawning as current user", user_name);
+        }
+    }
     let child = cmd
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to spawn {}: {}", binary.display(), e))?;
@@ -800,10 +864,11 @@ async fn service_monitor(
     service_type: String,
     avatar_socket: PathBuf,
     service_avatar_dir: Option<PathBuf>,
+    unix_user: Option<String>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
-        let mut child = match spawn_service_avatar(&service_type, &avatar_socket, service_avatar_dir.as_deref()).await {
+        let mut child = match spawn_service_avatar(&service_type, &avatar_socket, service_avatar_dir.as_deref(), unix_user.as_deref()).await {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to spawn {}: {}", service_type, e);
