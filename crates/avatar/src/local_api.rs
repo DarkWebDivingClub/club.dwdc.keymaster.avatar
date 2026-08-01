@@ -30,11 +30,6 @@ pub async fn start_listener(
 ) -> Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o666))?;
-    }
     info!("Local API listening on: {}", socket_path.display());
 
     tokio::spawn(async move {
