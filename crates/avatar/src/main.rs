@@ -253,16 +253,34 @@ async fn main() -> Result<()> {
     client.subscribe(vec![filter], None).await?;
     info!("Subscribed to kind {} events for #p={}", PROTOCOL_KIND, avatar_pubkey.to_hex());
 
-    // Ensure the API socket directory exists
-    std::fs::create_dir_all(&local_api_socket)?;
-    info!("API socket directory: {}", local_api_socket.display());
-
-    // Store login keys in Arcs for use in the event loop
+    // Store login keys in Arcs for use in the event loop and local API
     let login_xpriv = Arc::new(login_keys.xpriv);
     let login_xpub_arc = Arc::new(login_xpub);
-    let local_api_socket = Arc::new(local_api_socket);
     let avatar_keys_arc = Arc::new(avatar_keys.clone());
     let client_arc = Arc::new(client.clone());
+
+    // Set up local API socket
+    if user_map.is_some() {
+        // Multi-user mode: create directory for per-user sockets
+        std::fs::create_dir_all(&local_api_socket)?;
+        info!("API socket directory: {}", local_api_socket.display());
+    } else {
+        // Single-user mode: create socket file directly (default for
+        // development and Docker testing)
+        if let Some(parent) = local_api_socket.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        local_api::start_default_listener(
+            &local_api_socket,
+            avatar_keys_arc.clone(),
+            client_arc.clone(),
+            session_mgr.clone(),
+            pending_responses.clone(),
+        )
+        .await?;
+    }
+
+    let local_api_socket = Arc::new(local_api_socket);
 
     // Event loop
     let event_pending = pending_responses.clone();
