@@ -282,6 +282,25 @@ async fn main() -> Result<()> {
 
     let local_api_socket = Arc::new(local_api_socket);
 
+    // Spawn D-Bus listener for systemd-logind sleep/wake detection.
+    // On wake (PrepareForSleep(false)), force relay reconnect so
+    // nostr-sdk re-subscribes immediately instead of waiting for
+    // its ~10s auto-reconnect timer.
+    {
+        let wake_client = client_arc.clone();
+        let wake_relay_url = relay.clone();
+        tokio::spawn(async move {
+            debug!("Starting D-Bus sleep/wake listener task...");
+            match run_sleep_wake_listener(&wake_client, &wake_relay_url).await {
+                Ok(()) => warn!("D-Bus sleep/wake listener exited unexpectedly"),
+                Err(e) => {
+                    warn!("D-Bus sleep/wake listener unavailable: {}", e);
+                    warn!("Relay reconnect after sleep will rely on nostr-sdk auto-reconnect (~10s delay)");
+                }
+            }
+        });
+    }
+
     // Event loop
     let event_pending = pending_responses.clone();
     client
@@ -853,4 +872,55 @@ fn display_qr(data: &str) {
     } else {
         eprintln!("Failed to generate QR code");
     }
+}
+
+// --- systemd-logind sleep/wake detection ---
+
+#[zbus::proxy(
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1",
+    interface = "org.freedesktop.login1.Manager"
+)]
+trait Login1Manager {
+    #[zbus(signal)]
+    fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
+}
+
+/// Listen for systemd-logind PrepareForSleep signals and force a
+/// relay reconnect on wake. nostr-sdk auto-reconnects the transport
+/// and re-subscribes stored filters, but detection can take ~10s.
+/// This D-Bus listener triggers the reconnect immediately.
+async fn run_sleep_wake_listener(client: &Arc<Client>, relay_url: &str) -> anyhow::Result<()> {
+    use futures_util::StreamExt;
+
+    debug!("Connecting to system D-Bus...");
+    let connection = zbus::Connection::system().await?;
+    debug!("Creating logind proxy...");
+    let proxy = Login1ManagerProxy::new(&connection).await?;
+    debug!("Subscribing to PrepareForSleep signal...");
+    let mut stream = proxy.receive_prepare_for_sleep().await?;
+    info!("D-Bus sleep/wake listener active");
+
+    while let Some(signal) = stream.next().await {
+        let args = signal.args()?;
+        if args.start {
+            info!("System preparing for sleep");
+        } else {
+            info!("System woke from sleep, forcing relay reconnect");
+            if let Ok(relay) = client.relay(relay_url).await {
+                if let Err(e) = relay.disconnect() {
+                    warn!("Relay disconnect failed: {}", e);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            // connect_relay triggers reconnect + resubscribe
+            if let Err(e) = client.connect_relay(relay_url).await {
+                warn!("Relay reconnect failed: {} (auto-reconnect will retry)", e);
+            } else {
+                info!("Relay reconnect initiated after wake");
+            }
+        }
+    }
+
+    Ok(())
 }
