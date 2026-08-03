@@ -545,12 +545,20 @@ can become stale. After wake:
    ```bash
    ping -c 3 10.44.0.x    # check dnsmasq.leases for phone IP
    ```
-5. The avatar session is lost — re-attach from the phone
+5. Re-attach from the phone (the avatar session is lost on sleep)
+6. Restart the GPG service avatar:
+   ```bash
+   systemctl --user restart km-gpg-sa
+   ```
 
 Simply toggling "Internet access" without restarting the services
 can produce one-directional BNEP sessions that never recover.
 Restarting bt-nap.service recreates the bridge, clearing stale
 state from before suspend.
+
+km-gpg-sa does not recover cleanly after the phone reconnects —
+GPG signing fails with "Unknown packet" until the service is
+restarted. km-ssh-sa is not affected.
 
 Auto-reconnect without manual intervention is planned for a future
 release.
