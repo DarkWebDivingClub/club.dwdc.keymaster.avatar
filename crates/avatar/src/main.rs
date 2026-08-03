@@ -913,11 +913,19 @@ async fn run_sleep_wake_listener(client: &Arc<Client>, relay_url: &str) -> anyho
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            // connect_relay triggers reconnect + resubscribe
             if let Err(e) = client.connect_relay(relay_url).await {
                 warn!("Relay reconnect failed: {} (auto-reconnect will retry)", e);
             } else {
                 info!("Relay reconnect initiated after wake");
+                // Explicitly replay subscriptions — don't rely on
+                // nostr-sdk internal resubscribe heuristics.
+                if let Ok(relay) = client.relay(relay_url).await {
+                    if let Err(e) = relay.resubscribe().await {
+                        warn!("Relay resubscribe failed: {}", e);
+                    } else {
+                        info!("Relay filters resubscribed after wake");
+                    }
+                }
             }
         }
     }
