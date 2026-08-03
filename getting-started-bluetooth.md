@@ -300,13 +300,23 @@ during initial pairing.
 On the phone: Settings -> Bluetooth -> your laptop (gear icon) ->
 "Internet access" (Internetåtkomst) -> ON.
 
+The phone **must** initiate the connection — do not use
+`bluetoothctl connect` from the laptop (it fails with
+`br-connection-create-socket` because it tries the phone's NAP
+profile in the wrong direction).
+
 Verify on the laptop:
 
 ```bash
 ip addr show bt-nap-br            # should show inet 10.44.0.1/24
 cat /var/lib/misc/dnsmasq.leases  # should show phone's MAC + IP
-ping -c 3 10.44.0.4               # should get replies from phone
+ping -c 3 10.44.0.x               # phone (check leases for actual IP)
 ```
+
+**Always verify with ping.** The first BNEP session after pairing
+can be one-directional — DHCP succeeds but ping fails. If this
+happens, toggle "Internet access" off and on. The second session
+works.
 
 If dnsmasq was not running when the phone connected, restart it:
 
@@ -513,18 +523,34 @@ qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
 | Phone says "Reconnecting..." | Check BT PAN is connected. Toggle "Internet access" off and on. |
 | `bt-nap-br` not appearing | `sudo systemctl restart bt-nap.service` |
 | Phone gets no IP | Restart dnsmasq: `sudo systemctl restart dnsmasq`, then toggle "Internet access" off and on |
-| Ping laptop works but ping phone fails | Check `ip link show bt-nap-br` is UP. Restart bt-nap.service and reconnect from phone |
+| Ping laptop works but ping phone fails | One-directional BNEP session. Toggle "Internet access" off and on. |
+| `bluetoothctl connect` fails with `br-connection-create-socket` | Expected — do not connect from the laptop. The phone must initiate via "Internet access". |
+| DHCP lease assigned but ping fails | One-directional BNEP (first session after pairing). Toggle "Internet access" off and on. |
 | Permission denied on API socket | npub in `users.toml` does not match the phone's identity |
 | BT PAN connects but no `bt-pan` interface on phone | Known Samsung S24 Ultra issue. Use a MediaTek-based phone. |
 
 ## After sleep / wake
 
-When the laptop sleeps, the BT PAN link drops. After wake:
+When the laptop sleeps, the BT PAN link drops and the bridge state
+can become stale. After wake:
 
-1. The phone should reconnect BT automatically (it is still paired)
-2. You may need to toggle "Internet access" off and on
-3. dnsmasq may need a restart: `sudo systemctl restart dnsmasq`
-4. The avatar session is lost — re-attach from the phone
+1. Toggle "Internet access" **OFF** on the phone
+2. Restart the NAP and DHCP services on the laptop:
+   ```bash
+   sudo systemctl restart bt-nap.service
+   sudo systemctl restart dnsmasq
+   ```
+3. Toggle "Internet access" **ON** on the phone
+4. Verify with ping:
+   ```bash
+   ping -c 3 10.44.0.x    # check dnsmasq.leases for phone IP
+   ```
+5. The avatar session is lost — re-attach from the phone
+
+Simply toggling "Internet access" without restarting the services
+can produce one-directional BNEP sessions that never recover.
+Restarting bt-nap.service recreates the bridge, clearing stale
+state from before suspend.
 
 Auto-reconnect without manual intervention is planned for a future
 release.
