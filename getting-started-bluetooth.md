@@ -531,34 +531,97 @@ qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
 
 ## After sleep / wake
 
-When the laptop sleeps, the BT PAN link drops and the bridge state
-can become stale. After wake:
+When the laptop sleeps, the full stack goes down: the BT PAN link
+drops, the avatar relay session becomes stale, and the service
+avatars stop responding. All layers need recovery in order.
 
-1. Toggle "Internet access" **OFF** on the phone
-2. Restart the NAP and DHCP services on the laptop:
-   ```bash
-   sudo systemctl restart bt-nap.service
-   sudo systemctl restart dnsmasq
-   ```
-3. Toggle "Internet access" **ON** on the phone
-4. Verify with ping:
-   ```bash
-   ping -c 3 10.44.0.x    # check dnsmasq.leases for phone IP
-   ```
-5. Re-attach from the phone (the avatar session is lost on sleep)
-6. Restart the GPG service avatar:
-   ```bash
-   systemctl --user restart km-gpg-sa
-   ```
+### Step 1 — Restore BT PAN
 
-Simply toggling "Internet access" without restarting the services
-can produce one-directional BNEP sessions that never recover.
-Restarting bt-nap.service recreates the bridge, clearing stale
-state from before suspend.
+Restart the NAP and DHCP services. dnsmasq must be restarted
+**after** bt-nap (it fails if the bridge doesn't exist yet):
 
-km-gpg-sa does not recover cleanly after the phone reconnects —
-GPG signing fails with "Unknown packet" until the service is
-restarted. km-ssh-sa is not affected.
+```bash
+sudo systemctl restart bt-nap.service
+sleep 2
+sudo systemctl restart dnsmasq
+```
+
+### Step 2 — Reconnect the phone
+
+On the phone: Settings -> Bluetooth -> your laptop (gear icon) ->
+toggle "Internet access" **OFF**, wait a moment, then **ON**.
+
+The first BNEP session is usually one-directional. Verify with
+ping — if it fails, toggle "Internet access" off and on again:
+
+```bash
+ping -c 3 10.44.0.x    # check dnsmasq.leases for phone IP
+```
+
+### Step 3 — Restart the avatar
+
+The avatar's relay session is stale from before sleep. All
+requests through it will timeout until it is restarted:
+
+```bash
+sudo systemctl restart km-avatar
+```
+
+### Step 4 — Re-attach from the phone
+
+The avatar session is lost on sleep. Display the QR and re-attach:
+
+```bash
+qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
+```
+
+On the phone: KeyMaster app -> Attach to Avatar -> scan QR ->
+select your identity -> Attach.
+
+### Step 5 — Restart service avatars
+
+All three service avatars hold stale connections. SSH returns
+"agent refused operation" and GPG fails with "Unknown packet"
+until restarted:
+
+```bash
+systemctl --user restart km-ssh-sa km-gpg-sa km-nostr-sa
+```
+
+### Step 6 — Verify
+
+```bash
+ssh-add -l                           # expect keys
+echo test | gpg --clearsign          # expect signed message
+```
+
+### Summary
+
+The full recovery sequence after wake:
+
+```bash
+# 1. Restore BT PAN
+sudo systemctl restart bt-nap.service
+sleep 2
+sudo systemctl restart dnsmasq
+
+# 2. Toggle "Internet access" off/on on phone (may need twice)
+# 3. Verify BT PAN
+ping -c 3 10.44.0.x
+
+# 4. Restart avatar
+sudo systemctl restart km-avatar
+
+# 5. Re-attach from phone (scan QR)
+qrencode -t UTF8 < /run/keymaster-avatar/descriptor.json
+
+# 6. Restart service avatars
+systemctl --user restart km-ssh-sa km-gpg-sa km-nostr-sa
+
+# 7. Verify
+ssh-add -l
+echo test | gpg --clearsign
+```
 
 Auto-reconnect without manual intervention is planned for a future
 release.
