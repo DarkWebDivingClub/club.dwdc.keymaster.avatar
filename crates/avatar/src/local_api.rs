@@ -43,7 +43,7 @@ pub async fn start_default_listener(
                     let cli = client.clone();
                     let mgr = session_mgr.clone();
                     let pend = pending.clone();
-                    tokio::spawn(handle_connection(stream, keys, cli, mgr, pend));
+                    tokio::spawn(handle_connection(stream, keys, cli, mgr, pend, None));
                 }
                 Err(e) => {
                     error!("Local API accept error: {}", e);
@@ -60,12 +60,17 @@ pub async fn start_default_listener(
 /// The socket is chowned to the target user and chmoded to 0700 so only
 /// that user's service avatars can connect.
 ///
+/// `identity` scopes service channel lookups to the session that owns
+/// this socket, preventing cross-identity key confusion when multiple
+/// identities are attached simultaneously.
+///
 /// Returns the socket path and a shutdown sender. Drop or send on the
 /// sender to stop the listener and remove the socket.
 pub async fn start_user_listener(
     socket_dir: &Path,
     uid: u32,
     gid: u32,
+    identity: String,
     avatar_keys: Arc<Keys>,
     client: Arc<Client>,
     session_mgr: Arc<RwLock<SessionManager>>,
@@ -102,6 +107,7 @@ pub async fn start_user_listener(
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let path_for_cleanup = socket_path.clone();
 
+    let identity = Arc::new(identity);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -113,7 +119,8 @@ pub async fn start_user_listener(
                             let cli = client.clone();
                             let mgr = session_mgr.clone();
                             let pend = pending.clone();
-                            tokio::spawn(handle_connection(stream, keys, cli, mgr, pend));
+                            let ident = Some(identity.as_str().to_string());
+                            tokio::spawn(handle_connection(stream, keys, cli, mgr, pend, ident));
                         }
                         Err(e) => {
                             error!("Local API (uid={}) accept error: {}", uid, e);
@@ -139,6 +146,7 @@ async fn handle_connection(
     client: Arc<Client>,
     session_mgr: Arc<RwLock<SessionManager>>,
     pending: PendingResponses,
+    identity: Option<String>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
@@ -238,6 +246,7 @@ async fn handle_connection(
             &client,
             &session_mgr,
             &pending,
+            identity.as_deref(),
         )
         .await;
 
@@ -249,6 +258,10 @@ async fn handle_connection(
 }
 
 /// Forward a JSON-RPC request to the Nostr service channel and wait for the response.
+///
+/// When `identity` is Some, the service channel lookup is scoped to the
+/// session for that identity — this prevents returning a channel from a
+/// different identity when multiple identities are attached.
 async fn forward_to_nostr(
     service_type: &str,
     request: &JsonRpcRequest,
@@ -256,13 +269,18 @@ async fn forward_to_nostr(
     client: &Client,
     session_mgr: &Arc<RwLock<SessionManager>>,
     pending: &PendingResponses,
+    identity: Option<&str>,
 ) -> JsonRpcResponse {
     let id = request.id.clone().unwrap_or(Value::Null);
 
-    // Find the service channel
+    // Find the service channel — scoped to identity when available
     let channel_info = {
         let mgr = session_mgr.read().await;
-        mgr.find_service_channel(service_type)
+        if let Some(ident) = identity {
+            mgr.find_service_channel_for_identity(service_type, ident)
+        } else {
+            mgr.find_service_channel(service_type)
+        }
     };
 
     let (service_keys, km_service_pubkey, km_realm_pubkey) = match channel_info {

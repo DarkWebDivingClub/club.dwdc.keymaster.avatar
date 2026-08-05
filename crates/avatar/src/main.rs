@@ -641,6 +641,46 @@ async fn handle_attach(
         return Ok(());
     }
 
+    // Parse realm_xpub early — needed for idempotent re-attach check.
+    let realm_xpub: Option<Xpub> = params
+        .get("connector")
+        .and_then(|c| c.get("realm_xpub"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            Xpub::from_str(s)
+                .map_err(|e| warn!("Failed to parse realm_xpub: {}", e))
+                .ok()
+        });
+
+    // Re-attach handling: if the same km_pubkey already has a session,
+    // check whether the realm_xpub matches. If it does, the derived
+    // service channel keys are identical — just ack without tearing
+    // anything down. If it differs (user changed something), do a
+    // full detach-then-reattach.
+    {
+        let mgr = session_mgr.read().await;
+        if let Some(true) = mgr.realm_xpub_matches(km_pubkey, &realm_xpub) {
+            info!(
+                "Re-attach from {} with unchanged realm_xpub — acking without session recreation",
+                km_pubkey.to_hex()
+            );
+            drop(mgr);
+
+            let accepted: Vec<serde_json::Value> = services
+                .iter()
+                .map(|(t, seq)| serde_json::json!({ "type": t, "seq": seq }))
+                .collect();
+            let id = msg.id.clone().unwrap_or(serde_json::Value::Number(1.into()));
+            let response = JsonRpcResponse::success(
+                id,
+                serde_json::json!({ "accepted": accepted }),
+            );
+            send_response(avatar_keys, client, km_pubkey, &event.id, &response).await?;
+            info!("Idempotent re-attach response sent");
+            return Ok(());
+        }
+    }
+
     // Create shutdown channel (used by session manager on detach)
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
@@ -648,11 +688,11 @@ async fn handle_attach(
     {
         let mut mgr = session_mgr.write().await;
         // Evict stale session from same KM pubkey (e.g. phone reconnected
-        // after sleep without detaching first)
+        // with a different realm_xpub — full detach then re-attach)
         if let Some(old_sid) = mgr.find_session_by_km_pubkey(km_pubkey) {
             warn!(
                 "Evicting stale session {} from KM pubkey {} \
-                 (new attach replacing old)",
+                 (realm_xpub changed, full re-attach)",
                 old_sid, km_pubkey.to_hex()
             );
             mgr.remove_session(&old_sid);
@@ -663,21 +703,10 @@ async fn handle_attach(
             service_types.clone(),
             identity.clone(),
             vec![],
+            realm_xpub,
             Some(shutdown_tx),
         );
     }
-
-    // Try to extract realm_xpub from connector params for BIP-32 channel derivation.
-    // Fall back to using event pubkey directly for backwards compat.
-    let realm_xpub: Option<Xpub> = params
-        .get("connector")
-        .and_then(|c| c.get("realm_xpub"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| {
-            Xpub::from_str(s)
-                .map_err(|e| warn!("Failed to parse realm_xpub: {}", e))
-                .ok()
-        });
 
     // Derive and register service channels
     for (service_type, seq) in &services {
@@ -727,6 +756,7 @@ async fn handle_attach(
                 local_api_socket_dir,
                 user_entry.uid,
                 user_entry.gid,
+                identity.clone(),
                 avatar_keys_arc.clone(),
                 client_arc.clone(),
                 session_mgr.clone(),

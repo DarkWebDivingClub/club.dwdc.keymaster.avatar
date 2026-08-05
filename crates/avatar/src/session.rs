@@ -1,3 +1,4 @@
+use bitcoin::bip32::Xpub;
 use nostr::prelude::*;
 use nostr::nips::nip44;
 use std::collections::HashMap;
@@ -21,6 +22,7 @@ pub struct RootSession {
     pub services: Vec<String>,
     pub identity: String,
     pub alt_ids: Vec<String>,
+    pub realm_xpub: Option<Xpub>,
     pub channels: HashMap<String, ServiceChannel>,
     /// Shutdown signal sender for session cleanup
     pub shutdown: Option<watch::Sender<bool>>,
@@ -47,6 +49,7 @@ impl SessionManager {
         services: Vec<String>,
         identity: String,
         alt_ids: Vec<String>,
+        realm_xpub: Option<Xpub>,
         shutdown: Option<watch::Sender<bool>>,
     ) {
         let session = RootSession {
@@ -55,6 +58,7 @@ impl SessionManager {
             services,
             identity,
             alt_ids,
+            realm_xpub,
             channels: HashMap::new(),
             shutdown,
             api_socket_shutdown: None,
@@ -106,6 +110,21 @@ impl SessionManager {
             .map(|s| s.attached_session_event_id)
     }
 
+    /// Check if an existing session for `km_pubkey` has a matching realm_xpub.
+    /// Returns `Some(true)` if session exists and realm_xpub matches,
+    /// `Some(false)` if session exists but realm_xpub differs,
+    /// `None` if no session exists for this km_pubkey.
+    pub fn realm_xpub_matches(
+        &self,
+        km_pubkey: &PublicKey,
+        realm_xpub: &Option<Xpub>,
+    ) -> Option<bool> {
+        self.sessions
+            .values()
+            .find(|s| s.keymaster_pubkey == *km_pubkey)
+            .map(|s| s.realm_xpub == *realm_xpub)
+    }
+
     /// Signal shutdown for a session and remove it.
     pub fn remove_session(&mut self, session_id: &EventId) -> Option<RootSession> {
         if let Some(session) = self.sessions.get(session_id) {
@@ -137,6 +156,28 @@ impl SessionManager {
                     channel.km_service_pubkey,
                     channel.km_realm_pubkey,
                 ));
+            }
+        }
+        None
+    }
+
+    /// Find a service channel by type scoped to a specific identity.
+    /// Used by per-user API sockets to ensure the correct session's keys
+    /// are used when multiple identities are attached simultaneously.
+    pub fn find_service_channel_for_identity(
+        &self,
+        service_type: &str,
+        identity: &str,
+    ) -> Option<(Keys, PublicKey, PublicKey)> {
+        for session in self.sessions.values() {
+            if session.identity == identity {
+                if let Some(channel) = session.channels.get(service_type) {
+                    return Some((
+                        channel.service_avatar_keys.clone(),
+                        channel.km_service_pubkey,
+                        channel.km_realm_pubkey,
+                    ));
+                }
             }
         }
         None
@@ -195,6 +236,7 @@ mod tests {
             "alice".to_string(),
             vec![],
             None,
+            None,
         );
         assert!(mgr.find_session_by_km_pubkey(&km_pubkey).is_some());
 
@@ -208,6 +250,7 @@ mod tests {
             vec!["ssh".to_string()],
             "alice".to_string(),
             vec![],
+            None,
             None,
         );
 
@@ -237,6 +280,7 @@ mod tests {
             "alice".to_string(),
             vec![],
             None,
+            None,
         );
         mgr.add_service_channel(
             sid_a,
@@ -254,6 +298,7 @@ mod tests {
             vec!["ssh".to_string()],
             "bob".to_string(),
             vec![],
+            None,
             None,
         );
         mgr.add_service_channel(
@@ -275,6 +320,74 @@ mod tests {
     }
 
     #[test]
+    fn test_find_service_channel_for_identity() {
+        let mut mgr = SessionManager::new();
+
+        let keys_alice = Keys::generate();
+        let keys_bob = Keys::generate();
+        let svc_keys_alice = Keys::generate();
+        let svc_keys_bob = Keys::generate();
+        let km_svc_pk_alice = Keys::generate().public_key();
+        let km_svc_pk_bob = Keys::generate().public_key();
+
+        let sid_alice = random_event_id();
+        let sid_bob = random_event_id();
+
+        // Session for alice with gpg channel
+        mgr.create_root_session(
+            sid_alice,
+            keys_alice.public_key(),
+            vec!["gpg".to_string()],
+            "alice_npub_hex".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        mgr.add_service_channel(
+            sid_alice,
+            "gpg".to_string(),
+            svc_keys_alice.clone(),
+            km_svc_pk_alice,
+            keys_alice.public_key(),
+        );
+
+        // Session for bob with gpg channel
+        mgr.create_root_session(
+            sid_bob,
+            keys_bob.public_key(),
+            vec!["gpg".to_string()],
+            "bob_npub_hex".to_string(),
+            vec![],
+            None,
+            None,
+        );
+        mgr.add_service_channel(
+            sid_bob,
+            "gpg".to_string(),
+            svc_keys_bob.clone(),
+            km_svc_pk_bob,
+            keys_bob.public_key(),
+        );
+
+        // Identity-scoped lookup returns the correct session's keys
+        let result = mgr.find_service_channel_for_identity("gpg", "alice_npub_hex");
+        assert!(result.is_some());
+        let (found_keys, found_km_svc, _) = result.unwrap();
+        assert_eq!(found_keys.public_key(), svc_keys_alice.public_key());
+        assert_eq!(found_km_svc, km_svc_pk_alice);
+
+        let result = mgr.find_service_channel_for_identity("gpg", "bob_npub_hex");
+        assert!(result.is_some());
+        let (found_keys, found_km_svc, _) = result.unwrap();
+        assert_eq!(found_keys.public_key(), svc_keys_bob.public_key());
+        assert_eq!(found_km_svc, km_svc_pk_bob);
+
+        // Unknown identity returns None
+        let result = mgr.find_service_channel_for_identity("gpg", "unknown_npub");
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_remove_session_sends_shutdown() {
         let mut mgr = SessionManager::new();
         let km_keys = Keys::generate();
@@ -288,6 +401,7 @@ mod tests {
             vec!["ssh".to_string()],
             "alice".to_string(),
             vec![],
+            None,
             Some(shutdown_tx),
         );
 
