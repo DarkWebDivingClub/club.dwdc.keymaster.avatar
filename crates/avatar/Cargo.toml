@@ -11,9 +11,9 @@ path = "src/main.rs"
 [dependencies]
 avatar-protocol = { path = "../avatar-protocol" }
 
-# Nostr protocol
-nostr = { version = "0.45", features = ["std", "nip44"] }
-nostr-sdk = "0.45"
+# Nostr protocol (dwdc fork — see plan/pre-backlog/mission-35-nostr-sdk-upgrade.md)
+nostr = { git = "https://github.com/DarkWebDivingClub/nostr.git", tag = "v0.45.2-dwdc.0", features = ["std", "nip44"] }
+nostr-sdk = { git = "https://github.com/DarkWebDivingClub/nostr.git", tag = "v0.45.2-dwdc.0" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
