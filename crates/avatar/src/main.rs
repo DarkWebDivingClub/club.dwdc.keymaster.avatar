@@ -11,6 +11,7 @@ use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::FromHex;
 use bitcoin::secp256k1::{Secp256k1, schnorr::Signature as SchnorrSignature};
 use clap::Parser;
+use futures_util::StreamExt;
 use nostr::prelude::*;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
@@ -237,7 +238,9 @@ async fn main() -> Result<()> {
     let pending_responses: PendingResponses = Arc::new(RwLock::new(HashMap::new()));
 
     // Connect to relay
-    let client = Client::new(avatar_keys.clone());
+    let client = Client::builder()
+        .authenticator(SignerAuthenticator::new(avatar_keys.clone()))
+        .build();
     client.add_relay(&relay).await?;
     client.connect().await;
     info!("Connected to relay: {}", relay);
@@ -247,10 +250,10 @@ async fn main() -> Result<()> {
     // this single subscription catches both root and service channel events.
     let filter = Filter::new()
         .kind(Kind::Custom(PROTOCOL_KIND))
-        .custom_tag(SingleLetterTag::lowercase(Alphabet::P), [avatar_pubkey.to_hex()])
+        .custom_tag(SingleLetterTag::from_char('p').unwrap(), avatar_pubkey.to_hex())
         .since(Timestamp::now());
 
-    client.subscribe(vec![filter], None).await?;
+    client.subscribe(vec![filter]).await?;
     info!("Subscribed to kind {} events for #p={}", PROTOCOL_KIND, avatar_pubkey.to_hex());
 
     // Store login keys in Arcs for use in the event loop and local API
@@ -303,47 +306,31 @@ async fn main() -> Result<()> {
 
     // Event loop
     let event_pending = pending_responses.clone();
-    client
-        .handle_notifications(|notification| {
-            let avatar_keys = avatar_keys.clone();
-            let client_clone = client.clone();
-            let session_mgr = session_mgr.clone();
-            let pending = event_pending.clone();
-            let login_xpriv = login_xpriv.clone();
-            let login_xpub = login_xpub_arc.clone();
-            let allowlist = allowlist.clone();
-            let local_api_socket = local_api_socket.clone();
-            let user_map = user_map.clone();
-            let avatar_keys_arc = avatar_keys_arc.clone();
-            let client_arc = client_arc.clone();
-
-            async move {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::Custom(PROTOCOL_KIND) {
-                        if let Err(e) = handle_event(
-                            &avatar_keys,
-                            &client_clone,
-                            &session_mgr,
-                            &pending,
-                            &login_xpriv,
-                            &login_xpub,
-                            &allowlist,
-                            &local_api_socket,
-                            user_map.as_deref(),
-                            &avatar_keys_arc,
-                            &client_arc,
-                            &event,
-                        )
-                        .await
-                        {
-                            error!("Error handling event {}: {}", event.id, e);
-                        }
-                    }
+    let mut notifications = client.notifications();
+    while let Some(notification) = notifications.next().await {
+        if let ClientNotification::Event { event, .. } = notification {
+            if event.kind == Kind::Custom(PROTOCOL_KIND) {
+                if let Err(e) = handle_event(
+                    &avatar_keys,
+                    &client,
+                    &session_mgr,
+                    &event_pending,
+                    &login_xpriv,
+                    &login_xpub_arc,
+                    &allowlist,
+                    &local_api_socket,
+                    user_map.as_deref(),
+                    &avatar_keys_arc,
+                    &client_arc,
+                    &event,
+                )
+                .await
+                {
+                    error!("Error handling event {}: {}", event.id, e);
                 }
-                Ok(false) // continue listening
             }
-        })
-        .await?;
+        }
+    }
 
     Ok(())
 }
@@ -573,7 +560,7 @@ async fn handle_attach(
             let canonical = canonicalize_json(connector);
             let hash = sha256::Hash::hash(canonical.as_bytes());
             let msg_obj =
-                secp256k1::Message::from_digest(*hash.as_ref());
+                bitcoin::secp256k1::Message::from_digest(*hash.as_ref());
 
             let sig_bytes = match Vec::<u8>::from_hex(sig_hex) {
                 Ok(b) if b.len() == 64 => b,
@@ -852,12 +839,12 @@ async fn send_response(
     let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
         .tag(Tag::public_key(*recipient))
         .tag(Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::E)),
+            "e",
             vec![reply_to.to_hex(), String::new(), "reply".to_string()],
         ))
-        .sign_with_keys(avatar_keys)?;
+        .finalize(avatar_keys)?;
 
-    client.send_event(event).await?;
+    client.send_event(&event).await?;
     debug!(
         "Sent response to {} (reply to {})",
         recipient.to_hex(),
@@ -937,26 +924,12 @@ async fn run_sleep_wake_listener(client: &Arc<Client>, relay_url: &str) -> anyho
             info!("System preparing for sleep");
         } else {
             info!("System woke from sleep, forcing relay reconnect");
-            if let Ok(relay) = client.relay(relay_url).await {
-                if let Err(e) = relay.disconnect() {
-                    warn!("Relay disconnect failed: {}", e);
-                }
+            if let Ok(Some(relay)) = client.relay(relay_url).await {
+                relay.disconnect();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            if let Err(e) = client.connect_relay(relay_url).await {
-                warn!("Relay reconnect failed: {} (auto-reconnect will retry)", e);
-            } else {
-                info!("Relay reconnect initiated after wake");
-                // Explicitly replay subscriptions — don't rely on
-                // nostr-sdk internal resubscribe heuristics.
-                if let Ok(relay) = client.relay(relay_url).await {
-                    if let Err(e) = relay.resubscribe().await {
-                        warn!("Relay resubscribe failed: {}", e);
-                    } else {
-                        info!("Relay filters resubscribed after wake");
-                    }
-                }
-            }
+            client.connect().await;
+            info!("Relay reconnected after wake");
         }
     }
 

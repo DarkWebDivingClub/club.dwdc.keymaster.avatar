@@ -213,8 +213,8 @@ mod tests {
     /// Helper: generate a random EventId for testing.
     fn random_event_id() -> EventId {
         let keys = Keys::generate();
-        let event = EventBuilder::text_note("test")
-            .sign_with_keys(&keys)
+        let event = EventBuilder::new(Kind::TextNote, "test")
+            .finalize(&keys)
             .unwrap();
         event.id
     }

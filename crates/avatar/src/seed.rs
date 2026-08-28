@@ -51,7 +51,8 @@ pub fn resolve_seed(seed_path: &Path) -> Result<[u8; 32]> {
 
     // Generate and persist
     let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed).context("generating random seed")?;
+    getrandom::getrandom(&mut seed)
+        .map_err(|e| anyhow::anyhow!("generating random seed: {}", e))?;
 
     std::fs::write(seed_path, &seed)
         .with_context(|| format!("writing seed file: {}", seed_path.display()))?;
@@ -129,7 +130,7 @@ pub fn derive_service_pubkey(
     xpub: &Xpub,
     protocol: &str,
     seq: u32,
-) -> Result<nostr::PublicKey> {
+) -> Result<PublicKey> {
     let secp = Secp256k1::new();
     let h = ChildNumber::from_normal_idx(protocol_index(protocol))?;
     let s = ChildNumber::from_normal_idx(seq)?;
@@ -142,7 +143,7 @@ pub fn derive_service_pubkey(
     let compressed = child_xpub.public_key.serialize();
     // x-only key is bytes [1..33] of the compressed key
     let x_only = &compressed[1..33];
-    let nostr_pk = nostr::PublicKey::from_slice(x_only)
+    let nostr_pk = PublicKey::from_slice(x_only)
         .context("creating nostr pubkey from derived xpub")?;
     Ok(nostr_pk)
 }

@@ -389,13 +389,13 @@ async fn send_service_request(
     let event = EventBuilder::new(Kind::Custom(PROTOCOL_KIND), &encrypted)
         .tag(Tag::public_key(*km_service_pubkey))
         .tag(Tag::custom(
-            TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)),
+            "p",
             vec![km_realm_pubkey.to_hex(), String::new(), "realm".to_string()],
         ))
-        .sign_with_keys(service_keys)?;
+        .finalize(service_keys)?;
 
     let event_id = event.id;
-    client.send_event(event).await?;
+    client.send_event(&event).await?;
     debug!(
         "Sent service request {} to {}",
         event_id,
