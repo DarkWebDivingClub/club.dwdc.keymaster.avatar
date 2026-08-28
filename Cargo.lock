@@ -1175,7 +1175,7 @@ dependencies = [
 [[package]]
 name = "nostr"
 version = "0.45.3"
-source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.0#c6bc84f2932fd61b3a045f521fadcd3739026e40"
+source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.1#99a1a0691fca05d7c291a6d0ac9adc79f794795c"
 dependencies = [
  "base64",
  "bech32 0.12.0",
@@ -1199,7 +1199,7 @@ dependencies = [
 [[package]]
 name = "nostr-database"
 version = "0.45.1"
-source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.0#c6bc84f2932fd61b3a045f521fadcd3739026e40"
+source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.1#99a1a0691fca05d7c291a6d0ac9adc79f794795c"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1208,7 +1208,7 @@ dependencies = [
 [[package]]
 name = "nostr-gossip"
 version = "0.45.0"
-source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.0#c6bc84f2932fd61b3a045f521fadcd3739026e40"
+source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.1#99a1a0691fca05d7c291a6d0ac9adc79f794795c"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1217,7 +1217,7 @@ dependencies = [
 [[package]]
 name = "nostr-sdk"
 version = "0.45.2"
-source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.0#c6bc84f2932fd61b3a045f521fadcd3739026e40"
+source = "git+https://github.com/DarkWebDivingClub/nostr.git?tag=v0.45.2-dwdc.1#99a1a0691fca05d7c291a6d0ac9adc79f794795c"
 dependencies = [
  "async-utility",
  "async-wsocket",
