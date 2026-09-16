@@ -63,6 +63,14 @@ struct Cli {
     /// Path to write the descriptor JSON file
     #[arg(long, default_value = "/etc/keymaster-avatar/descriptor.json")]
     descriptor_path: PathBuf,
+
+    /// Bluetooth address for RFCOMM transport (e.g. "28:6B:35:B4:BA:85")
+    #[arg(long)]
+    bt_addr: Option<String>,
+
+    /// RFCOMM channel number (default 3, only used when --bt-addr is set)
+    #[arg(long, default_value = "3")]
+    rfcomm_channel: u8,
 }
 
 #[derive(Deserialize, Default)]
@@ -74,6 +82,8 @@ struct Config {
     allowlist: Option<String>,
     users_file: Option<PathBuf>,
     descriptor_path: Option<PathBuf>,
+    bt_addr: Option<String>,
+    rfcomm_channel: Option<u8>,
 }
 
 /// Pending response futures for service channel requests sent to KM.
@@ -164,6 +174,13 @@ async fn main() -> Result<()> {
             .descriptor_path
             .unwrap_or_else(|| cli.descriptor_path.clone())
     };
+    let bt_addr = cli.bt_addr.or(config.bt_addr);
+    let rfcomm_channel = cli.rfcomm_channel; // CLI default is 3; config overrides only if CLI is default
+    let rfcomm_channel = if rfcomm_channel != 3 {
+        rfcomm_channel
+    } else {
+        config.rfcomm_channel.unwrap_or(rfcomm_channel)
+    };
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -207,11 +224,15 @@ async fn main() -> Result<()> {
     info!("Login xpub: {}", login_xpub);
 
     // Build descriptor payload (deterministic from seed)
-    let descriptor = serde_json::json!({
+    let mut descriptor = serde_json::json!({
         "relay": &relay,
         "login_xpub": login_xpub.to_string(),
         "services": ["ssh", "gpg", "nostr"]
     });
+    if let Some(ref addr) = bt_addr {
+        descriptor["bt_addr"] = serde_json::Value::String(addr.clone());
+        descriptor["rfcomm_channel"] = serde_json::Value::Number(rfcomm_channel.into());
+    }
     let descriptor_json = serde_json::to_string_pretty(&descriptor)?;
 
     // Write descriptor file
@@ -230,6 +251,9 @@ async fn main() -> Result<()> {
     println!("Relay: {}", relay);
     println!("Avatar pubkey: {}", avatar_pubkey.to_hex());
     println!("Login xpub: {}", login_xpub);
+    if let Some(ref addr) = bt_addr {
+        println!("RFCOMM: {} channel {}", addr, rfcomm_channel);
+    }
     println!("Descriptor: {}", descriptor_path.display());
     println!("\nWaiting for KeyMaster attach...\n");
 
